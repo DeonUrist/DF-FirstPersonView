@@ -27,6 +27,7 @@ struct Camera {
     float ang = 0;          // heading in radians, 0 = north, clockwise
     float fov = 80;         // horizontal field of view in degrees
     float pitch = 0;        // vertical shift of the horizon, in pixels
+    float tilt = 0;         // real tilt up (+) or down (-), in radians: the graphics card renderer (gpu.h) only
 };
 
 // what is under a pixel, for mouse picking

@@ -81,6 +81,8 @@ public:
 
     // forget everything (texture numbers are reassigned when a world loads)
     void clear();
+    // goes up whenever everything was forgotten: ids from before mean nothing now
+    uint32_t generation() const { return generation_; }
 
     // copy a game texture into out[TEXPIX] (resampled to 32x32); false if unavailable
     static bool readSprite(int32_t texpos, uint32_t *out);
@@ -122,6 +124,7 @@ private:
     std::vector<bool> is_material_;                   // per texture id
     std::unordered_map<uint16_t, uint16_t> bare_;     // over() texture -> its base
     uint16_t specials_[4] = {0, 0, 0, 0};
+    uint32_t generation_ = 0;
 };
 
 } // namespace fpv

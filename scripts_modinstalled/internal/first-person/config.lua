@@ -51,13 +51,15 @@ SCHEMA = {
         desc='show your own paperdoll, with wounds and a blood bar, in place of the portrait'},
     realtime_rate={default=5, kind='number', min=1, max=99, plugin=true,
         desc='game ticks per second while the timer button lets time pass by itself (a wait is 10; the mouse wheel over the timer changes this)'},
+    new_renderer={default=false, kind='boolean', plugin=true,
+        desc='draw the view on the graphics card, so you can look straight up or down (off: the software renderer)'},
     start_enabled={default=false, kind='boolean',
         desc='switch to first person automatically when an adventure is loaded'},
 }
 
 ORDER = {'hotkey', 'fov', 'resolution', 'view_distance', 'range', 'levels_up', 'levels_down',
          'relative_controls', 'smooth', 'compass', 'minimap', 'minimap_ascii', 'minimap_tiles', 'wasd', 'mouse_look', 'combat_menus', 'game_tips', 'body_doll',
-         'realtime_rate', 'start_enabled'}
+         'realtime_rate', 'new_renderer', 'start_enabled'}
 
 local function settings_path()
     return scriptmanager.getModStatePath(MOD_ID) .. 'settings.json'

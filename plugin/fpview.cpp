@@ -127,6 +127,8 @@
 
 #include "media.h"
 #include "render.h"
+#include "render3d.h"
+#include "gpu.h"
 #include "scene.h"
 
 using std::string;
@@ -190,6 +192,7 @@ decltype(&SDL_GetKeyboardFocus) sdl_get_keyboard_focus = nullptr;
 decltype(&SDL_GetKeyboardState) sdl_get_keyboard_state = nullptr;
 decltype(&SDL_AddEventWatch) sdl_add_event_watch = nullptr;   // optional: only the mouse wheel needs them
 decltype(&SDL_DelEventWatch) sdl_del_event_watch = nullptr;
+fpv::GpuApi gpu_api;   // what the renderer on the graphics card needs; not there in an old SDL
 bool sdl_bound = false;
 
 bool bind_sdl(color_ostream &out) {
@@ -231,6 +234,15 @@ bool bind_sdl(color_ostream &out) {
 #undef BIND
     sdl_add_event_watch = reinterpret_cast<decltype(sdl_add_event_watch)>(LookupPlugin(handle, "SDL_AddEventWatch"));
     sdl_del_event_watch = reinterpret_cast<decltype(sdl_del_event_watch)>(LookupPlugin(handle, "SDL_DelEventWatch"));
+    gpu_api.create_texture = sdl_create_texture;
+    gpu_api.destroy_texture = sdl_destroy_texture;
+    gpu_api.update_texture = sdl_update_texture;
+    gpu_api.set_texture_blend_mode = sdl_set_texture_blend_mode;
+    gpu_api.set_texture_scale_mode = sdl_set_texture_scale_mode;
+    gpu_api.render_geometry =
+        reinterpret_cast<decltype(gpu_api.render_geometry)>(LookupPlugin(handle, "SDL_RenderGeometry"));
+    gpu_api.get_renderer_info =
+        reinterpret_cast<decltype(gpu_api.get_renderer_info)>(LookupPlugin(handle, "SDL_GetRendererInfo"));
     sdl_bound = true;
     return true;
 }
@@ -257,6 +269,7 @@ struct Settings {
     std::atomic<bool> smooth{true};
     std::atomic<bool> compass{true};
     std::atomic<int> realtime_rate{5};        // game ticks per second while time runs by itself
+    std::atomic<bool> new_renderer{false};    // draw through the graphics card: the view tilts for real (gpu.h)
 } settings;
 
 // ---------------------------------------------------------------------------
@@ -271,6 +284,10 @@ bool space_stopped = false;             // Space turned the timer off; that pres
 
 fpv::Scene scene;
 std::unique_ptr<fpv::Renderer> renderer;
+std::unique_ptr<fpv::GpuRenderer> gpu;          // the renderer on the graphics card, made when first used
+std::atomic<bool> drew_3d{false};               // the last frame came from it
+std::atomic<uint32_t> stat_gpu_tris{0};
+std::atomic<bool> gpu_refused{false};           // SDL would not draw its triangles: the software renderer from then on
 
 // where the camera wants to be; written by the simulation thread
 std::mutex target_mutex;
@@ -671,9 +688,12 @@ fpv::Pick pick_pixels(int px, int py) {
     if (ow <= 0 || oh <= 0 || px < 0 || py < 0 || px >= ow || py >= oh)
         return p;
     std::lock_guard<std::mutex> lock(scene.mutex);
+    if (drew_3d && gpu)
+        return gpu->pick(scene, (px + 0.5f) / ow, (py + 0.5f) / oh);
+    const int x = int(int64_t(px) * stat_w.load() / ow), y = int(int64_t(py) * stat_h.load() / oh);
     if (!renderer)
         return p;
-    return renderer->pick(int(int64_t(px) * stat_w.load() / ow), int(int64_t(py) * stat_h.load() / oh));
+    return renderer->pick(x, y);
 }
 
 // ---------------------------------------------------------------------------
@@ -3328,6 +3348,30 @@ IMPLEMENT_VMETHOD_INTERPOSE(dungeon_hook, logic);
 
 SDL_Texture *frame_texture = nullptr;
 int tex_w = 0, tex_h = 0;
+// With the graphics card drawing the world, the frame only carries what is
+// painted over it (what you hold, the marks of a fight) and is see-through
+// everywhere else.
+bool frame_overlay = false;
+// the part of the frame painted over the world this time
+struct FxPainted {
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    void reset() { x0 = y0 = x1 = y1 = 0; }
+    void add(int ax0, int ay0, int ax1, int ay1) {
+        if (ax1 <= ax0 || ay1 <= ay0)
+            return;
+        if (x1 <= x0 || y1 <= y0) {
+            x0 = ax0;
+            y0 = ay0;
+            x1 = ax1;
+            y1 = ay1;
+        } else {
+            x0 = std::min(x0, ax0);
+            y0 = std::min(y0, ay0);
+            x1 = std::max(x1, ax1);
+            y1 = std::max(y1, ay1);
+        }
+    }
+} fx_painted;
 std::vector<uint32_t> frame_buffer;
 Camera camera;
 bool camera_valid = false;
@@ -3363,6 +3407,8 @@ void destroy_frame_texture() {
         sdl_destroy_texture(frame_texture);
     frame_texture = nullptr;
     tex_w = tex_h = 0;
+    if (gpu)
+        gpu->dropTextures();
     if (mini_texture && sdl_destroy_texture)
         sdl_destroy_texture(mini_texture);
     mini_texture = nullptr;
@@ -3533,6 +3579,8 @@ void draw_minimap(df::renderer_2d_base *r, SDL_Renderer *sdl) {
 }
 
 float look_yaw = 0, look_pitch = 0;   // radians; fraction of the view height
+// testing aids: hold the view at a tilt / a heading given in degrees (1000 = off)
+std::atomic<float> debug_tilt{1000}, debug_yaw{1000};
 bool look_valid = false;              // look_yaw holds where the mouse last pointed the camera
 int look_heading = -1;
 
@@ -3661,6 +3709,7 @@ void draw_held(uint32_t *buf, int W, int H, int cx, int cy) {
             x0 += int((cx - (x0 + size / 2)) * k);
             y0 += int((cy - (y0 + size / 2)) * k);
         }
+        fx_painted.add(x0, y0, x0 + size, H);
         for (int x = std::max(0, x0); x < std::min(W, x0 + size); ++x) {
             int tx = (x - x0) * fpv::TEX / size;
             if (hand == 0)
@@ -3680,13 +3729,18 @@ void draw_held(uint32_t *buf, int W, int H, int cx, int cy) {
     }
 }
 
-// mix a colour into a pixel of the frame (0xAABBGGRR)
+// mix a colour into a pixel of the frame (0xAABBGGRR). The pixel may be
+// see-through itself (the frame lying over a world drawn by the graphics card).
 inline void blend(uint32_t &dst, int r, int g, int b, float a) {
     if (a <= 0)
         return;
     a = std::min(a, 1.0f);
+    const float da = fpv::px_a(dst) / 255.0f;
+    const float oa = a + da * (1 - a);
+    const float ka = a / oa, kd = da * (1 - a) / oa;
     const int dr = fpv::px_r(dst), dg = fpv::px_g(dst), db = fpv::px_b(dst);
-    dst = fpv::rgb(int(dr + (r - dr) * a), int(dg + (g - dg) * a), int(db + (b - db) * a));
+    dst = (fpv::rgb(int(r * ka + dr * kd), int(g * ka + dg * kd), int(b * ka + db * kd)) & 0x00FFFFFFu) |
+          (uint32_t(oa * 255.0f + 0.5f) << 24);
 }
 
 // the attack crescents and the arrows of strikes at you, into the frame
@@ -3706,17 +3760,12 @@ void draw_combat_fx(uint32_t *buf, int W, int H, const fpv::Camera &cam, int cx,
     if (arcs.empty() && arrows.empty() && texts.empty())
         return;
     const double now = fx_now();
-    const float P = std::tan(cam.fov * 3.14159265f / 360.0f);
-    const float S = W / (2 * P), hz = H / 2.0f + cam.pitch;
+    const fpv::View3D view = fpv::View3D::of(cam, W, H);
+    const float S = view.S;
     const float dirx = std::sin(cam.ang), diry = -std::cos(cam.ang), rgtx = std::cos(cam.ang), rgty = std::sin(cam.ang);
+    // on the screen as either renderer draws it
     const auto project = [&](float x, float y, float h, float &sx, float &sy, float &d) {
-        const float rx = x - cam.x, ry = y - cam.y;
-        d = rx * dirx + ry * diry;
-        if (d < 0.2f)
-            return false;
-        sx = W / 2.0f + (rx * rgtx + ry * rgty) * S / d;
-        sy = hz + (cam.eye - h) * S / d;
-        return true;
+        return view.project(x, y, h, sx, sy, d) && d >= 0.2f;
     };
 
     // a white crescent swept across the strike, bulging towards the target
@@ -3746,6 +3795,7 @@ void draw_combat_fx(uint32_t *buf, int W, int H, const fpv::Camera &cam, int cx,
         const float alpha = 0.55f * (1 - t);
         const int x0 = std::max(0, int(mx - r)), x1 = std::min(W - 1, int(mx + r));
         const int y0 = std::max(0, int(my - r)), y1 = std::min(H - 1, int(my + r));
+        fx_painted.add(x0, y0, x1 + 1, y1 + 1);
         for (int x = x0; x <= x1; ++x) {
             uint32_t *col = buf + size_t(x) * H;
             for (int y = y0; y <= y1; ++y) {
@@ -3779,6 +3829,7 @@ void draw_combat_fx(uint32_t *buf, int W, int H, const fpv::Camera &cam, int cx,
             sy -= t * H * 0.06f + tx.stack * (cell_h + 2);
             const float alpha = t < 0.6f ? 1.0f : std::max(0.0f, 1 - (t - 0.6f) / 0.4f);
             const int x0 = int(sx) - int(tx.text.size()) * cell_w / 2, y0 = int(sy) - cell_h;
+            fx_painted.add(x0 - 1, y0 - 1, x0 + int(tx.text.size()) * cell_w + 1, y0 + cell_h + 1);
             const auto glyphs = [&](int ox, int oy, int r, int g, int b, float a) {
                 for (size_t i = 0; i < tx.text.size(); ++i) {
                     const uint8_t *rows = ui_font.rows[uint8_t(tx.text[i])];
@@ -3821,6 +3872,7 @@ void draw_combat_fx(uint32_t *buf, int W, int H, const fpv::Camera &cam, int cx,
         const float reach = r1 + wide + 3;
         const int x0 = std::max(0, int(cx - reach)), x1 = std::min(W - 1, int(cx + reach));
         const int y0 = std::max(0, int(cy - reach)), y1 = std::min(H - 1, int(cy + reach));
+        fx_painted.add(x0, y0, x1 + 1, y1 + 1);
         const auto inside = [&](float u, float w, float grow) {
             if (u >= r0 - grow && u <= r1 - head && std::abs(w) <= half + grow)
                 return true;
@@ -3893,6 +3945,7 @@ void draw_view(df::renderer_2d_base *r) {
         tex_w = W;
         tex_h = H;
         frame_buffer.assign(size_t(W) * H, 0xFF000000u);
+        frame_overlay = false;
     }
 
     // glide towards where the adventurer is and where they look
@@ -3986,7 +4039,21 @@ void draw_view(df::renderer_2d_base *r) {
             camera.ang = look_yaw;
         }
     }
-    camera.pitch = look_pitch * H;
+    // Looking up and down: the renderer on the graphics card tilts the camera
+    // for real, up to nearly straight up or down; the software one slides the
+    // picture up or down.
+    const bool want_gpu = settings.new_renderer && gpu_api.ok() && !gpu_refused;
+    if (debug_tilt.load() < 999)
+        look_pitch = std::clamp(debug_tilt.load() / 90.0f, -1.0f, 1.0f);
+    if (debug_yaw.load() < 999)
+        camera.ang = debug_yaw.load() * 0.0174532925f;
+    if (want_gpu) {
+        camera.tilt = look_pitch * 1.55f;
+        camera.pitch = 0;
+    } else {
+        camera.tilt = 0;
+        camera.pitch = look_pitch * H;
+    }
     show_pointer(look_on ? Pointer::None : Pointer::Gauntlet);
 
     view_out_w = out_w;
@@ -4006,10 +4073,36 @@ void draw_view(df::renderer_2d_base *r) {
     opt.fog = t.fog;
 
     const auto t0 = std::chrono::steady_clock::now();
+    bool gpu_frame = false;
     {
         std::lock_guard<std::mutex> lock(scene.mutex);
-        renderer->render(scene, camera, opt, W, H, frame_buffer.data());
+        if (want_gpu) {
+            if (!gpu)
+                gpu = std::make_unique<fpv::GpuRenderer>(gpu_api);
+            gpu_frame = gpu->build(sdl, scene, camera, opt, out_w, out_h);
+        }
+        if (gpu_frame)
+            stat_gpu_tris = uint32_t(gpu->triangles());
+        else
+            renderer->render(scene, camera, opt, W, H, frame_buffer.data());
+        drew_3d = gpu_frame;
     }
+    // what the last frame painted over the world: x0, y0, x1, y1
+    static int painted_before[4] = {0, 0, 0, 0};
+    bool send_all = false;
+    if (gpu_frame != frame_overlay) {
+        frame_overlay = gpu_frame;
+        sdl_set_texture_blend_mode(frame_texture, gpu_frame ? SDL_BLENDMODE_BLEND : SDL_BLENDMODE_NONE);
+        if (gpu_frame)
+            std::fill(frame_buffer.begin(), frame_buffer.end(), 0u);
+        painted_before[0] = painted_before[1] = painted_before[2] = painted_before[3] = 0;
+        send_all = true;
+    }
+    if (gpu_frame)
+        for (int x = painted_before[0]; x < painted_before[2]; ++x)
+            std::fill(frame_buffer.begin() + size_t(x) * H + painted_before[1],
+                      frame_buffer.begin() + size_t(x) * H + painted_before[3], 0u);
+    fx_painted.reset();
     {
         // the pointer, in the frame's pixels: the middle while the mouse turns the view
         int fx = W / 2, fy = H / 2;
@@ -4034,9 +4127,48 @@ void draw_view(df::renderer_2d_base *r) {
         draw_combat_fx(frame_buffer.data(), W, H, camera, fx, fy, cell_w, cell_h, doll_x, doll_y);
         draw_held(frame_buffer.data(), W, H, fx, fy);
     }
-    renderer->swapRedBlue(frame_buffer.data(), size_t(W) * H);   // our pixels are ABGR
     const auto t1 = std::chrono::steady_clock::now();
-    sdl_update_texture(frame_texture, nullptr, frame_buffer.data(), H * 4);
+    if (!gpu_frame) {
+        renderer->swapRedBlue(frame_buffer.data(), size_t(W) * H);   // our pixels are ABGR
+        sdl_update_texture(frame_texture, nullptr, frame_buffer.data(), H * 4);
+    } else {
+        // only what was painted now, and what was painted before and is gone
+        int now_r[4] = {std::clamp(fx_painted.x0, 0, W), std::clamp(fx_painted.y0, 0, H),
+                        std::clamp(fx_painted.x1, 0, W), std::clamp(fx_painted.y1, 0, H)};
+        if (now_r[2] <= now_r[0] || now_r[3] <= now_r[1])
+            now_r[0] = now_r[1] = now_r[2] = now_r[3] = 0;
+        for (int x = now_r[0]; x < now_r[2]; ++x) {
+            uint32_t *col = frame_buffer.data() + size_t(x) * H;
+            for (int y = now_r[1]; y < now_r[3]; ++y) {
+                const uint32_t c = col[y];
+                col[y] = (c & 0xFF00FF00u) | ((c & 0xFFu) << 16) | ((c >> 16) & 0xFFu);
+            }
+        }
+        int u[4] = {now_r[0], now_r[1], now_r[2], now_r[3]};
+        if (painted_before[2] > painted_before[0]) {
+            if (u[2] <= u[0]) {
+                std::copy(painted_before, painted_before + 4, u);
+            } else {
+                u[0] = std::min(u[0], painted_before[0]);
+                u[1] = std::min(u[1], painted_before[1]);
+                u[2] = std::max(u[2], painted_before[2]);
+                u[3] = std::max(u[3], painted_before[3]);
+            }
+        }
+        if (send_all) {
+            u[0] = u[1] = 0;
+            u[2] = W;
+            u[3] = H;
+        }
+        if (u[2] > u[0] && u[3] > u[1]) {
+            // the texture is the picture on its side: a column of the frame is a row of it
+            const SDL_Rect part = {u[1], u[0], u[3] - u[1], u[2] - u[0]};
+            sdl_update_texture(frame_texture, &part, frame_buffer.data() + size_t(u[0]) * H + u[1], H * 4);
+        }
+        std::copy(now_r, now_r + 4, painted_before);
+        if (!gpu->draw(sdl))
+            gpu_refused = true;
+    }
 
     // Turn the sideways texture back upright: flip it, then rotate a quarter
     // turn around its top-left corner, which ends up at the top right of the
@@ -4175,7 +4307,7 @@ command_result set_setting(color_ostream &out, const string &key, const string &
     try {
         if (key == "relative_controls" || key == "smooth" || key == "compass" || key == "minimap" ||
             key == "minimap_ascii" || key == "wasd" || key == "mouse_look" || key == "combat_menus" ||
-            key == "game_tips" || key == "body_doll") {
+            key == "game_tips" || key == "body_doll" || key == "new_renderer") {
             if (!parse_bool(value, b))
                 return CR_WRONG_USAGE;
             if (key == "relative_controls") settings.relative_controls = b;
@@ -4187,6 +4319,7 @@ command_result set_setting(color_ostream &out, const string &key, const string &
             else if (key == "combat_menus") settings.combat_menus = b;
             else if (key == "game_tips") settings.game_tips = b;
             else if (key == "body_doll") settings.body_doll = b;
+            else if (key == "new_renderer") settings.new_renderer = b;
             else settings.compass = b;
             return CR_OK;
         }
@@ -4297,6 +4430,16 @@ command_result do_command(color_ostream &out, vector<string> &parameters) {
         heading = (heading + (parameters[1] == "left" ? 7 : 1)) % 8;
         return CR_OK;
     }
+    if ((cmd == "tilt" || cmd == "yaw") && parameters.size() == 2) {
+        // testing aid: look up or down / in a direction by so many degrees, as the mouse would
+        float v = 1000;
+        if (parameters[1] != "off")
+            v = float(std::atof(parameters[1].c_str()));
+        (cmd == "tilt" ? debug_tilt : debug_yaw) = v;
+        if (cmd == "tilt" && v > 999)
+            look_pitch = 0;
+        return CR_OK;
+    }
     if (cmd == "pointer" && parameters.size() >= 2) {
         // testing aid: pretend the mouse is at this window pixel ("pointer off" to stop)
         if (parameters[1] == "off") {
@@ -4338,7 +4481,14 @@ command_result do_command(color_ostream &out, vector<string> &parameters) {
         bool found = false;
         {
             std::lock_guard<std::mutex> lock(scene.mutex);
-            found = renderer && renderer->findCreature(x, y);
+            float fx = 0, fy = 0;
+            if (drew_3d && gpu) {
+                found = gpu->findCreature(scene, fx, fy);
+                x = int(fx * stat_w.load());
+                y = int(fy * stat_h.load());
+            } else {
+                found = renderer && renderer->findCreature(x, y);
+            }
         }
         if (!found || stat_w.load() <= 0) {
             out.print("no creature in view\n");
@@ -4415,6 +4565,15 @@ command_result do_command(color_ostream &out, vector<string> &parameters) {
                   stat_w.load(), stat_h.load(), renderer ? renderer->threads() : 0,
                   stat_render_us.load() / 1000.0, stat_upload_us.load() / 1000.0,
                   stat_capture_us.load() / 1000.0, stat_frames.load());
+    if (gpu_refused)
+        out.print("  graphics card renderer: not available (the game's renderer would not draw its triangles)\n");
+    else if (!gpu_api.ok())
+        out.print("  graphics card renderer: not available (this SDL has no SDL_RenderGeometry)\n");
+    else if (drew_3d && gpu)
+        out.print("  graphics card renderer: on, {} triangles, texture {}x{} {}% full ({})\n", stat_gpu_tris.load(),
+                  gpu->atlasSize(), gpu->atlasSize(), gpu->atlasPercent(), gpu->timings());
+    else
+        out.print("  graphics card renderer: off\n");
     out.print("  map reads left out (the game drew some other place): {}\n", stat_reads_skipped.load());
     out.print("  fov {}  resolution {}%  view_distance {}  range {}  levels_up {}  levels_down {}\n",
               settings.fov.load(), int(settings.resolution.load() * 100 + 0.5f), settings.view_distance.load(),
@@ -4502,6 +4661,7 @@ DFhackCExport command_result plugin_shutdown(color_ostream &out) {
     // give a frame that is already inside one of the hooks time to finish
     std::this_thread::sleep_for(std::chrono::milliseconds(120));
     renderer.reset();
+    gpu.reset();
     // The textures belong to the render thread, which normally frees them
     // when the view is switched off; if they are still here they are left to SDL.
     frame_texture = nullptr;

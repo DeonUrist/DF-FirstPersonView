@@ -12,6 +12,7 @@ aim_wrestle.png
 icon_ascii.png      the three buttons next to the minimap, 16 x 12 pixels (two interface cells)
 icon_zoom_in.png
 icon_zoom_out.png
+icon_settings.png   the gear under them, which opens the mod's settings
 button_camera.png   the camera button next to the game's "View your companions" button.
                     Exactly 32 x 36 pixels (4 x 3 interface cells of 8 x 12).
 button_timer.png    the timer button right of it, off and on. Exactly 56 x 36 pixels (7 x 3 cells).

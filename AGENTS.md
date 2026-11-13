@@ -89,7 +89,10 @@ a few lines each):
   `fpview face N|NE|...`, `fpview camera <x> <y> <z>|off`, `fpview debug ctrl|look|noblank|center
   on|off`, `fpview intent [next|strike|shoot|throw|wrestle]`, `fpview menu` (contents and pixel
   positions of the paperdoll/attack menu), `fpview hint`, `fpview mouselog` (what recent clicks and
-  the Ctrl-click driver did). Always end with `fpview pointer off` and `fpview debug ctrl off`.
+  the Ctrl-click driver did), `fpview tilt <degrees>|off` and `fpview yaw <degrees>|off` (look up
+  or down and in any direction, as the mouse would). Always end with `fpview pointer off` and
+  `fpview debug ctrl off`. `fpview status` shows which renderer drew the last frame, its triangle
+  count and where its time went.
 - **What the test pointer cannot do**: real mouse look (it needs window focus and the real mouse),
   real key state (Ctrl+R, Shift+Space), and the main-thread races described below. Several bugs only
   appeared with real input; say so when a fix could not be reproduced.
@@ -115,6 +118,9 @@ Hooks (`VTableInterpose`, all in `plugin/fpview.cpp`):
 - `logic`: slides the hidden map so the game's own hover box describes the looked-at tile.
 - `renderer_2d_base::update_all` (`draw_view`): camera animation, mouse look, ray-cast the frame
   into a texture drawn under the interface, then minimap, compass, player doll, menus, crosshair.
+  With `new_renderer` the world is drawn by `gpu.cpp` instead and the frame texture becomes a
+  see-through layer over it that only carries what you hold and the marks of a fight (only the
+  part of it that changed is uploaded).
 
 Files:
 
@@ -127,6 +133,19 @@ Files:
   front to back, with a list of still-empty row ranges per column for occlusion. Vertical faces,
   horizontal surfaces, slopes, boxes inside tiles; billboards last with a depth test. Pitch is a
   vertical shift of the horizon, not a real rotation. Pixels are stored column by column.
+- `gpu.h/.cpp`: the renderer on the graphics card (setting `new_renderer`). It builds textured
+  triangles and hands them to the game's SDL renderer with `SDL_RenderGeometry`, so it works on
+  every SDL back end; nothing in it is specific to a system or a card. No depth buffer: tiles are
+  emitted far to near (rows of the map side by side on worker threads, joined in order), and inside
+  a tile floor, blocks, furniture, things and door frames go in a fixed order. No perspective
+  inside a triangle: `quad()` cuts surfaces near the eye into pieces. No shaders: haze is a second
+  see-through triangle in the haze's colour, the highlight a white one. One 4096 x 4096 atlas
+  holds every wall/floor texture (with smaller copies for far away), every sprite, its white
+  silhouette and its outlined variant; it starts again when full. The software renderer is the
+  reference for how things look: compare the two when changing either.
+- `render3d.h/.cpp`: `View3D` (a camera that really tilts: used by the graphics card renderer and
+  for placing marks on the screen) and `pick_ray` (what one ray through a pixel hits: mouse
+  picking for the graphics card renderer, which keeps no per-pixel record).
 - `textures.h/.cpp`: reads the game's sprites from `enabler->textures.raws` and makes 32x32
   textures: tinted patterns (`material`), flattened sprites, crops.
 - `media.h/.cpp`: loads `media` (via DFHack's `DFIMG_Load`), paperdoll layouts and the doll matcher
@@ -182,6 +201,12 @@ the paperdoll and attack menus, Throw end to end, Shoot up to and through carefu
 paperdoll, intent switching and aim marks, compass picture, game tip aimed at the looked-at tile,
 our tip above the bottom buttons, Camera button, player paperdoll with blood bar, arena support,
 Space and Shift+Space waiting.
+
+The graphics card renderer was compared with the software one in the game on 2026-11-13 (town,
+altar and statue, well, rooftops, slopes, palm forest, shop sign, looking straight up and down,
+view distance 160, picking, tile highlight, the ring under a creature, switching between the two
+while playing): the pictures matched. Not seen with it: real mouse look, the marks of a fight
+(crescents, arrows, rising words) over it, water, fortifications, a night scene, Linux.
 
 Built and installed but **never seen running** (the owner asked for build-only, or they need real
 input):

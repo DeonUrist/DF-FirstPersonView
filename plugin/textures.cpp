@@ -259,6 +259,7 @@ TextureStore::TextureStore() {
 }
 
 void TextureStore::clear() {
+    ++generation_;
     texs_.clear();
     texs_.emplace_back(nullptr);
     index_.clear();

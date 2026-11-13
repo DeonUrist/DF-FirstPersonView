@@ -475,12 +475,12 @@ end
 -- back, "+" and "-" zoom it
 MinimapButtons = defclass(nil, overlay.OverlayWidget)
 MinimapButtons.ATTRS{
-    desc='Adds buttons next to the first-person minimap: @ switches it between graphics and text characters, + and - zoom it.',
+    desc='Adds buttons next to the first-person minimap: @ switches it between graphics and text characters, + and - zoom it, the gear opens the settings.',
     default_enabled=true,
     default_pos={x=-30, y=3},
     viewscreens='dungeonmode',
-    frame={w=4, h=9},
-    version=3,
+    frame={w=4, h=12},
+    version=4,
     visible=minimap_shown,
 }
 
@@ -489,6 +489,40 @@ function MinimapButtons:init()
         framed_icon('ascii', 0, 'icon_ascii', '@'),
         framed_icon('zoom_in', 3, 'icon_zoom_in', '+'),
         framed_icon('zoom_out', 6, 'icon_zoom_out', '-'),
+        framed_icon('settings', 9, 'icon_settings', string.char(15)),
+    }
+end
+
+-- The mod's settings, opened by the gear next to the minimap
+SettingsScreen = defclass(nil, gui.ZScreen)
+SettingsScreen.ATTRS{
+    focus_path='first-person/settings',
+}
+
+function SettingsScreen:init()
+    self:addviews{
+        widgets.Window{
+            frame={w=56, h=9},
+            frame_title='First Person View settings',
+            subviews={
+                widgets.ToggleHotkeyLabel{
+                    view_id='new_renderer',
+                    frame={t=0, l=0},
+                    key='CUSTOM_N',
+                    label='New renderer',
+                    initial_option=config.get('new_renderer'),
+                    on_change=function(on)
+                        dfhack.run_command_silent('first-person', 'set', 'new_renderer', tostring(on))
+                    end,
+                },
+                widgets.WrappedLabel{
+                    frame={t=2, l=0},
+                    text_to_wrap='Draws the view on the graphics card: look straight up or down without '
+                        .. 'the picture stretching. Off: the software renderer.',
+                    text_pen=COLOR_GREY,
+                },
+            },
+        },
     }
 end
 
@@ -511,6 +545,9 @@ function MinimapButtons:onInput(keys)
         elseif on_button(views.zoom_out) then
             dfhack.run_command_silent('first-person', 'set', 'minimap_tiles',
                 tostring(math.min(61, config.get('minimap_tiles') + zoom_step(config.get('minimap_tiles')))))
+            return true
+        elseif on_button(views.settings) then
+            SettingsScreen{}:show()
             return true
         end
     end

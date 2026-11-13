@@ -514,6 +514,22 @@ from_rows([
     "................",
 ], ICON).save('msg_show.png')
 
+# the gear next to the minimap that opens the settings
+from_rows([
+    "................",
+    ".......##.......",
+    "...##.####.##...",
+    "...##########...",
+    "....###..###....",
+    "..####....####..",
+    "..####....####..",
+    "....###..###....",
+    "...##########...",
+    "...##.####.##...",
+    ".......##.......",
+    "................",
+], ICON).save('icon_settings.png')
+
 README = os.path.join(ROOT, 'README.txt')
 if os.path.exists(README):
     print('kept README.txt')

@@ -104,7 +104,7 @@ game starts (`first-person reload` reads it again):
 | `cursor.png` | the pointer while it is free (Alt held, or a menu open); the top left corner is the tip |
 | `crosshair.png` | the crosshair; the middle of the picture is the aim point |
 | `aim_strike.png`, `aim_shoot.png`, `aim_throw.png`, `aim_wrestle.png` | the crosshair while Ctrl is held, one per intent |
-| `icon_ascii.png`, `icon_zoom_in.png`, `icon_zoom_out.png` | the buttons next to the minimap, 16 x 12 pixels |
+| `icon_ascii.png`, `icon_zoom_in.png`, `icon_zoom_out.png`, `icon_settings.png` | the buttons next to the minimap, 16 x 12 pixels (the gear opens the mod's settings) |
 | `button_camera.png` | the camera button, the whole button with its border, exactly 32 x 36 pixels |
 | `button_timer.png`, `button_timer_on.png` | the timer button stopped and running, exactly 56 x 36 pixels; the number is written over pixels 32-47 across, 12-23 down |
 | `button_travel.png`, `button_sleep.png` | the travel (map) and sleep buttons, exactly 32 x 36 pixels each; only used when the game has no pictures of its own for them (no graphics) |
@@ -247,6 +247,7 @@ Stored in `<DF>/dfhack-config/mods/first_person_view/settings.json`.
 | `smooth` | `true` | animate turning, walking and climbing |
 | `compass` | `true` | heading indicator at the top of the screen, with the nearby places on it |
 | `minimap` | `true` | top-down map in the top right corner instead of the buttons there |
+| `new_renderer` | `false` | draw the view on the graphics card instead of in software. The camera then really tilts: you can look straight up (at birds overhead) or straight down without the picture stretching. It goes through the game's own SDL renderer, so it works wherever the game does (Windows or Linux, any maker of graphics card); if the game's SDL cannot do it, the software renderer is used. `resolution` does not apply to it: it always draws at the window's full size. Also switched by the gear next to the minimap |
 | `realtime_rate` | `5` | game ticks a second while the timer button lets time pass by itself (1 to 99; a wait is 10; the mouse wheel over the button changes it) |
 | `start_enabled` | `false` | switch the view on automatically when an adventure loads |
 
@@ -283,11 +284,21 @@ ground), the ramp dips in the middle as a channel towards that side, so what lie
   stand on the ground at the lowest drawn pixel; boulders are sunk halfway in.
 - **Drawing.** A software renderer walks the map for every screen column and draws wall faces,
   floors, ceilings and billboards. Columns are spread over all CPU cores, which is what makes a
-  full-resolution frame take a millisecond or two.
+  full-resolution frame take a few milliseconds. It can only slide the picture up and down to
+  look up or down.
+- **Drawing on the graphics card** (`new_renderer`). The world is turned into textured triangles
+  and handed to the game's own SDL renderer (`SDL_RenderGeometry`), which fills them in on the
+  graphics card. Only the corners are worked out on the CPU, spread over several cores, so a frame
+  takes about a millisecond and the camera can tilt freely. SDL draws flat triangles only, with no
+  depth buffer: tiles are drawn far to near, surfaces close to the eye are cut into small pieces so
+  their pictures do not bend, and haze is a second see-through triangle over each one. All
+  pictures are kept in one large texture, each wall and floor texture with smaller copies of
+  itself that are used far away, where the full picture would flicker.
 - **Display.** The plugin hooks the stage of the game's renderer that draws the interface and,
   just before it, copies its image over the map. The interface then lands on top. The camera
   is animated there, on the render thread, so motion is smooth.
-- **Mouse.** The renderer remembers which tile or creature every pixel shows. The game works
+- **Mouse.** The software renderer remembers which tile or creature every pixel shows; with the
+  graphics card renderer one ray is followed through the map for the pixel asked about. The game works
   out what the mouse is on from the mouse position and the origin of the map window, so for
   the moment the game handles a click or draws its hover text, the plugin moves the map window
   so that the answer is the tile the pointer is on in 3D.

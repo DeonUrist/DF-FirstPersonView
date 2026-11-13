@@ -5,6 +5,8 @@ set(FPVIEW_HDRS
     media.h
     menu.inc
     render.h
+    render3d.h
+    gpu.h
     scene.h
     spatter.h
     textures.h
@@ -15,6 +17,8 @@ dfhack_plugin(fpview
     fpview.cpp
     media.cpp
     render.cpp
+    render3d.cpp
+    gpu.cpp
     scene.cpp
     spatter.cpp
     textures.cpp
