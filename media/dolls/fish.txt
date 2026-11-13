@@ -1,0 +1,11 @@
+# fish and other swimmers, seen from the side
+# body part name = x, y   where its two letters go on fish.png, in pixels of the picture.
+# Several names for one place are separated with "|". Names are the ones the game
+# shows in the "What do you want to aim for?" list. Parts that are not listed here go
+# into the list next to the picture. The picture whose parts fit the creature best is used.
+tail = 120, 50
+dorsal fin = 74, 24
+lower body = 90, 50
+upper body | body = 58, 46
+right fin | right flipper | right front fin | right front flipper = 62, 70
+head = 22, 50

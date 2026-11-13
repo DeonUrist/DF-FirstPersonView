@@ -5,7 +5,7 @@
 [EARLIEST_COMPATIBLE_DISPLAYED_VERSION:0.1.0]
 [AUTHOR:SET_YOUR_NAME_HERE]
 [NAME:First Person View]
-[DESCRIPTION:Press a hotkey (Ctrl-Shift-F by default) in adventure mode to see the world in first person. The view is ray-cast from the game's own sprites and shows several z-levels at once: hills, pits, upper floors and tree canopies. The normal adventure interface keeps working on top of it. Requires DFHack.]
+[DESCRIPTION:Press a hotkey (Ctrl-Shift-F by default) in adventure mode to see the world in first person. The view is ray-cast from the game's own sprites and shows several z-levels at once: hills, pits, upper floors and tree canopies. The normal adventure interface keeps working on top of it. Requires DFHack and the fpview plugin that comes with this mod's source.]
 
 [STEAM_TITLE:First Person View]
 [STEAM_DESCRIPTION:Adventure mode in first person.
@@ -14,7 +14,7 @@ Press Ctrl-Shift-F (configurable) while playing an adventurer and the map turns 
 
 Movement keys become relative to where you are looking: up walks forward, left and right turn.
 
-This is a DFHack script mod. It does not change raws or saves and does not need to be enabled for a world. Requires DFHack.]
+It does not change raws or saves and does not need to be enabled for a world. The drawing is done by a native DFHack plugin (fpview) that has to be built for your DFHack version and placed in hack/plugins; see the README. Requires DFHack.]
 [STEAM_TAG:dfhack]
 [STEAM_TAG:adventure]
 [STEAM_TAG:graphics]

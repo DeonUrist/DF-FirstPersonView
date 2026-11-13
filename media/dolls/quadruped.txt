@@ -1,0 +1,17 @@
+# four legs, no neck (QUADRUPED)
+# body part name = x, y   where its two letters go on quadruped.png, in pixels of the picture.
+# Several names for one place are separated with "|". Names are the ones the game
+# shows in the "What do you want to aim for?" list. Parts that are not listed here go
+# into the list next to the picture. The picture whose parts fit the creature best is used.
+tail = 120, 48
+lower body = 88, 42
+upper body | body = 54, 42
+right front leg = 34, 66
+left front leg = 56, 66
+right front foot | right front hoof = 31, 83
+left front foot | left front hoof = 56, 83
+right rear leg = 86, 66
+left rear leg = 108, 66
+right rear foot | right rear hoof = 85, 83
+left rear foot | left rear hoof = 110, 83
+head = 22, 34

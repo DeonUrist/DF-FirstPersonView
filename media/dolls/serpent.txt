@@ -1,0 +1,9 @@
+# creatures that are a body, a head and perhaps a tail: snakes, worms, slugs
+# body part name = x, y   where its two letters go on serpent.png, in pixels of the picture.
+# Several names for one place are separated with "|". Names are the ones the game
+# shows in the "What do you want to aim for?" list. Parts that are not listed here go
+# into the list next to the picture. The picture whose parts fit the creature best is used.
+tail = 74, 120
+lower body = 42, 88
+upper body | body = 44, 46
+head = 62, 20

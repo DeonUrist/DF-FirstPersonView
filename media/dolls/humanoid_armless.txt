@@ -1,0 +1,15 @@
+# legs but no arms (HUMANOID_ARMLESS)
+# body part name = x, y   where its two letters go on humanoid_armless.png, in pixels of the picture.
+# Several names for one place are separated with "|". Names are the ones the game
+# shows in the "What do you want to aim for?" list. Parts that are not listed here go
+# into the list next to the picture. The picture whose parts fit the creature best is used.
+right upper leg | right leg = 40, 88
+right lower leg = 38, 108
+right foot | right hoof = 33, 125
+left upper leg | left leg = 56, 88
+left lower leg = 58, 108
+left foot | left hoof = 63, 125
+lower body = 48, 69
+upper body | body = 48, 45
+neck = 48, 30
+head = 48, 14

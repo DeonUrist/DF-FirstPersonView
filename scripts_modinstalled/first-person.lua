@@ -7,12 +7,16 @@ first-person
 
 Tags: adventure | graphics | interface
 
-Renders adventure mode from a first-person perspective.
+Shows adventure mode from a first-person perspective.
 
-The map area is replaced with a ray-cast 3D view of the z-level you are on,
-drawn with the sprites the game itself uses for the tiles, plants, items and
-creatures around you. The rest of the adventure mode interface keeps working
-on top of it. Press the hotkey again to return to the normal view.
+The map area is replaced with a 3D view of your surroundings, drawn with the
+sprites the game itself uses for the tiles, plants, items and creatures around
+you, across several z-levels. The rest of the adventure mode interface keeps
+working on top of it. Press the hotkey again to return to the normal view.
+
+The drawing is done by the ``fpview`` plugin (``hack/plugins/fpview.plug.dll``),
+which has to be installed alongside this script. This script provides the
+hotkey and remembers your settings.
 
 Usage
 -----
@@ -22,6 +26,8 @@ Usage
     first-person status
     first-person hotkey [<key>]
     first-person set <setting> <value>
+    first-person realtime [on|off|toggle]
+    first-person reload
 
 Examples
 --------
@@ -32,8 +38,15 @@ Examples
     Toggle with Alt-V instead. The choice is remembered.
 ``first-person set fov 90``
     Use a wider field of view.
+``first-person set resolution 50``
+    Draw at half the window resolution (faster on slow machines).
 ``first-person status``
     Show whether the view is on and list every setting with its value.
+``first-person realtime``
+    Let time pass by itself (``realtime_rate`` game ticks a second), or stop it.
+    The same as the timer button. Space also stops it.
+``first-person reload``
+    Read the settings and the art in the mod's ``media`` folder again.
 
 Controls
 --------
@@ -47,34 +60,694 @@ With ``relative_controls`` off, keys keep their normal compass meaning and
 the view turns to face the direction you last moved in.
 ]====]
 
-local gui = require('gui')
-local overlay = require('plugins.overlay')
-
 local config = reqscript('internal/first-person/config')
-local fbuf = reqscript('internal/first-person/framebuffer')
-local sprites = reqscript('internal/first-person/sprites')
-local scene_mod = reqscript('internal/first-person/scene')
-local raycaster = reqscript('internal/first-person/raycaster')
 
 local GLOBAL_KEY = 'first-person'
 local TOGGLE_COMMAND = 'first-person toggle'
+local PLUGIN = config.PLUGIN
 
-local DIR_NAMES = {[0]='N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'}
-local DIR_DX = {[0]=0, 1, 1, 1, 0, -1, -1, -1}
-local DIR_DY = {[0]=-1, -1, 0, 1, 1, 1, 0, -1}
-
-local MOVE_SPEED = 9          -- tiles per second when gliding to a new tile
-local TURN_SPEED = 7.5        -- radians per second
-local CLIMB_SPEED = 7         -- tile widths per second when changing height
-local SCENE_INTERVAL_MS = 120
-local SCENE_INTERVAL_MOVING_MS = 60
-
-state = state or {
-    active=false,
-    heading=0,      -- 0..7, index into DIR_NAMES
-}
 registered_hotkey = registered_hotkey or nil
-frame = frame or {}
+
+local gui = require('gui')
+local overlay = require('plugins.overlay')
+local widgets = require('gui.widgets')
+
+-- the plugin keeps these globals up to date while it runs
+local function minimap_shown()
+    return _G.fpview_minimap_shown == true
+end
+
+local function view_shown()
+    return _G.fpview_view_shown == true
+end
+
+local function realtime_on()
+    return _G.fpview_realtime_on == true
+end
+
+---------------------------------------------------------------------------
+-- interface buttons, framed like the game's own panels
+
+-- where the mod is installed, and its art folder
+function mod_dir()
+    local path = dfhack.findScript('first-person')
+    if not path then return nil end
+    path = path:gsub('\\', '/')
+    return (path:gsub('/scripts_modinstalled/first%-person%.lua$', ''))
+end
+
+function media_dir()
+    local dir = mod_dir()
+    return dir and (dir .. '/media') or nil
+end
+
+-- a 16 x 12 picture from the art folder as two interface tiles; nil if it is not there
+icon_handles = icon_handles or {}
+local function icon_tile(name, half)
+    local handles = icon_handles[name]
+    if handles == nil then
+        handles = false
+        local dir = media_dir()
+        local file = dir and (dir .. '/' .. name .. '.png')
+        if file and dfhack.filesystem.exists(file) then
+            local ok, loaded = pcall(dfhack.textures.loadTileset, file, 8, 12, true)
+            if ok and loaded and #loaded >= 2 then handles = loaded end
+        end
+        icon_handles[name] = handles
+    end
+    if not handles then return nil end
+    return dfhack.textures.getTexposByHandle(handles[half])
+end
+
+-- DFHack keeps every picture it has loaded, by file name, until the game is
+-- closed: art installed or edited while the game runs would never show (the
+-- camera button kept its old look that way). So each version of a picture is
+-- loaded from its own copy, named after the file's modification time.
+local function art_copy(file, name, mtime)
+    local dir = require('script-manager').getModStatePath(config.MOD_ID) .. 'art'
+    if not dfhack.filesystem.mkdir_recursive(dir) then return file end
+    mtime = math.floor(mtime)
+    local copy = ('%s/%s-%d.png'):format(dir, name, mtime)
+    if dfhack.filesystem.isfile(copy) then return copy end
+    local src = io.open(file, 'rb')
+    if not src then return file end
+    local data = src:read('*a')
+    src:close()
+    local dst = io.open(copy, 'wb')
+    if not dst then return file end
+    dst:write(data)
+    dst:close()
+    -- older copies of the same picture are of no more use
+    for _, other in ipairs(dfhack.filesystem.listdir(dir) or {}) do
+        if other ~= ('%s-%d.png'):format(name, mtime) and other:match('^' .. name:gsub('%W', '%%%0') .. '%-%d+%.png$') then
+            os.remove(dir .. '/' .. other)
+        end
+    end
+    return copy
+end
+
+-- a whole button picture from the art folder, cut into w x h interface
+-- cells (8 x 12 pixels each); nil if it is missing or not that size. The
+-- file is looked at again every few seconds, so new art shows by itself.
+button_pictures = button_pictures or {}
+local function button_tiles(name, w, h)
+    local entry = button_pictures[name]
+    local now = dfhack.getTickCount()
+    if not entry or now - entry.checked > 3000 then
+        local dir = media_dir()
+        local file = dir and (dir .. '/' .. name .. '.png')
+        local mtime = file and dfhack.filesystem.isfile(file) and dfhack.filesystem.mtime(file) or nil
+        if not entry or entry.mtime ~= mtime then
+            entry = {mtime=mtime, handles=false}
+            if mtime then
+                local ok, loaded = pcall(dfhack.textures.loadTileset, art_copy(file, name, mtime), 8, 12, true)
+                if ok and loaded and #loaded == w * h then entry.handles = loaded end
+            end
+            button_pictures[name] = entry
+        end
+        entry.checked = now
+    end
+    return entry.handles or nil
+end
+
+-- Paints a button the size of the game's square ones: the picture if there
+-- is one, else fallback(dc, pen) draws it in text characters.
+local function paint_button(dc, name, w, h, lit, hover, fallback)
+    local handles = button_tiles(name, w, h)
+    if handles then
+        for y = 0, h - 1 do
+            for x = 0, w - 1 do
+                dc:seek(x, y):tile(nil, dfhack.textures.getTexposByHandle(handles[y * w + x + 1]))
+            end
+        end
+        return
+    end
+    for y = 0, h - 1 do
+        dc:seek(0, y):string((' '):rep(w), {fg=COLOR_BLACK, bg=COLOR_BLACK})
+    end
+    fallback(dc, {fg=(hover or lit) and COLOR_YELLOW or COLOR_WHITE, bg=COLOR_BLACK})
+end
+
+-- rows of characters (numbers are code page 437 codes) drawn from the top left
+local function char_rows(dc, rows, pen)
+    for y, row in ipairs(rows) do
+        for x, ch in ipairs(row) do
+            dc:seek(x - 1, y - 1):char(type(ch) == 'number' and string.char(ch) or ch, pen)
+        end
+    end
+end
+
+-- the fallbacks: a camera, a map, a sleeper's "Zz", each in 4 x 3 cells.
+-- The camera is solid blocks with a ring for the lens (9), no letters.
+local function camera_chars(dc, pen)
+    char_rows(dc, {{' ', 220, 220, ' '}, {219, 9, 219, 219}, {223, 223, 223, 223}}, pen)
+end
+
+local function map_chars(dc, pen)
+    char_rows(dc, {{218, 196, 196, 191}, {179, '~', 30, 179}, {192, 196, 196, 217}}, pen)
+end
+
+local function sleep_chars(dc, pen)
+    char_rows(dc, {{' ', ' ', 'z', ' '}, {' ', 'Z', ' ', ' '}, {'Z', ' ', ' ', ' '}}, pen)
+end
+
+-- Mouse wheel notches over a widget since it was last drawn (up is
+-- positive). The plugin counts the wheel itself, as with Alt held (to free the
+-- pointer from mouse look) the game makes no key of it.
+local function wheel_moved(widget)
+    local total = _G.fpview_wheel
+    if type(total) ~= 'number' then return 0 end
+    local now = dfhack.getTickCount()
+    local seen, at = widget.wheel_seen, widget.wheel_at
+    widget.wheel_seen, widget.wheel_at = total, now
+    -- not drawn for a while: the wheel was turned somewhere else
+    if not seen or now - at > 500 then return 0 end
+    return total - seen
+end
+
+-- the wheel as keys, for when the plugin does not count it: 1 up, -1 down
+local function wheel_key(keys)
+    if keys.CONTEXT_SCROLL_UP or keys.CONTEXT_SCROLL_PAGEUP then return 1 end
+    if keys.CONTEXT_SCROLL_DOWN or keys.CONTEXT_SCROLL_PAGEDOWN then return -1 end
+    return 0
+end
+
+local function plugin_counts_wheel()
+    return type(_G.fpview_wheel) == 'number'
+end
+
+-- a framed button showing a picture from the art folder (or a character if there is none)
+local function framed_icon(id, top, icon, fallback)
+    local panel
+    local function pen() return panel:getMousePos() and COLOR_YELLOW or COLOR_WHITE end
+    local has_icon = icon_tile(icon, 1) ~= nil
+    local text
+    if has_icon then
+        text = {{tile=function() return icon_tile(icon, 1) end}, {tile=function() return icon_tile(icon, 2) end}}
+    else
+        text = {{text=' ' .. fallback, pen=pen}}
+    end
+    panel = widgets.Panel{
+        view_id=id,
+        frame={t=top, l=0, w=4, h=3},
+        frame_style=gui.FRAME_INTERIOR_MEDIUM,
+        frame_background=gui.CLEAR_PEN,
+        subviews={widgets.Label{frame={t=0, l=0}, text=text}},
+    }
+    return panel
+end
+
+-- true if the pointer is on the button, its frame included
+local function on_button(panel)
+    local x, y = dfhack.screen.getMousePos()
+    local r = panel.frame_rect
+    local p = panel.frame_parent_rect
+    if not x or not r or not p then return false end
+    x, y = x - p.x1, y - p.y1
+    return x >= r.x1 and x <= r.x2 and y >= r.y1 and y <= r.y2
+end
+
+-- The game's square buttons beside the portrait sit 4 interface cells apart
+-- (32 pixels at 8 x 12 cells), each picture a little narrower than its 4
+-- cells. "View your companions" takes columns 12 to 15 of the upper row, the
+-- row of buttons under it columns 12 to 35, then the speed display ("Walk")
+-- columns 36 to about 45 (measured on a screenshot of the game). Ours take
+-- 4 x 3 cells (32 x 36 pixels): the camera in the next slot, column 16
+-- (x=17), the timer after it (columns 20 to 26). While the view shows, the
+-- plugin moves the game's lower row and the speed display up beside the timer
+-- (columns 27 to 60) and the action bar down right of the portrait; the
+-- travel and sleep buttons follow the speed display, from column 61.
+--
+-- Each widget class is made anew (defclass(nil, ...)) every time this file is
+-- loaded. DFHack keeps a script's globals when the file is reloaded, and
+-- defclass on an existing class keeps the methods the new file no longer
+-- has: an old CameraButton:init kept adding the framed " Camera " caption
+-- (cut to "C") over the camera picture.
+
+-- A camera, right of "View your companions": switches between the normal and
+-- the first-person view
+CameraButton = defclass(nil, overlay.OverlayWidget)
+CameraButton.ATTRS{
+    desc='Adds a camera button next to "View your companions" that switches between the normal and the first-person view.',
+    default_enabled=true,
+    default_pos={x=17, y=-4},
+    viewscreens='dungeonmode',
+    frame={w=4, h=3},
+    version=7,
+}
+
+function CameraButton:onRenderBody(dc)
+    paint_button(dc, 'button_camera', 4, 3, false, self:getMousePos() ~= nil, camera_chars)
+end
+
+-- The press is looked for while drawing, not in onInput: another mod's
+-- widget in the same spot (Herald's alert) may take the click before it gets
+-- here, and the button would do nothing.
+function CameraButton:render(dc)
+    local down = df.global.enabler.mouse_lbut_down ~= 0
+    if down and not self.was_down and self:getMousePos() then
+        dfhack.run_command('first-person', 'toggle')
+    end
+    self.was_down = down
+    CameraButton.super.render(self, dc)
+end
+
+function CameraButton:onInput(keys)
+    -- a click on the button is ours and goes no further
+    if keys._MOUSE_L and self:getMousePos() then
+        return true
+    end
+    return CameraButton.super.onInput(self, keys)
+end
+
+-- the timer's number one wheel notch further: by 1 up to 10, then by 5
+local function next_rate(rate, dir)
+    if dir > 0 then
+        rate = rate < 10 and rate + 1 or rate + 5
+    else
+        rate = rate > 10 and math.max(10, rate - 5) or rate - 1
+    end
+    return math.max(1, math.min(99, rate))
+end
+
+local function wheel_rate(notches)
+    local rate = config.get('realtime_rate')
+    for _ = 1, math.abs(notches) do
+        rate = next_rate(rate, notches)
+    end
+    if rate ~= config.get('realtime_rate') then
+        dfhack.run_command_silent('first-person', 'set', 'realtime_rate', tostring(rate))
+    end
+end
+
+local function timer_chars(dc, pen)
+    char_rows(dc, {{' ', 220, ' '}, {'(', '/', ')'}, {' ', 223, ' '}}, pen)
+end
+
+-- A timer right of the camera, with the number of game ticks a second beside
+-- it: a click lets time pass by itself (or stops it), the mouse wheel over it
+-- changes the number. Only there while the first-person view is.
+TimeButton = defclass(nil, overlay.OverlayWidget)
+TimeButton.ATTRS{
+    desc='Adds a timer button next to the camera button that lets time pass by itself; the mouse wheel over it sets how fast.',
+    default_enabled=true,
+    default_pos={x=21, y=-4},
+    viewscreens='dungeonmode',
+    frame={w=7, h=3},
+    version=2,
+    visible=view_shown,
+}
+
+function TimeButton:onRenderBody(dc)
+    local on = realtime_on()
+    local hover = self:getMousePos() ~= nil
+    paint_button(dc, on and 'button_timer_on' or 'button_timer', 7, 3, on, hover, timer_chars)
+    dc:seek(4, 1):string(('%2d'):format(config.get('realtime_rate')),
+        {fg=(on or hover) and COLOR_YELLOW or COLOR_WHITE, bg=COLOR_BLACK})
+end
+
+-- pressed: see CameraButton:render
+function TimeButton:render(dc)
+    local down = df.global.enabler.mouse_lbut_down ~= 0
+    local over = self:getMousePos() ~= nil
+    if down and not self.was_down and over then
+        dfhack.run_command_silent('first-person', 'realtime', 'toggle')
+    end
+    self.was_down = down
+    local notches = wheel_moved(self)
+    if notches ~= 0 and over then
+        wheel_rate(notches)
+    end
+    TimeButton.super.render(self, dc)
+end
+
+function TimeButton:onInput(keys)
+    if not self:getMousePos() then
+        return TimeButton.super.onInput(self, keys)
+    end
+    if keys._MOUSE_L then
+        return true
+    end
+    -- the wheel as keys never reaches the game here; the plugin's count is
+    -- used when there is one, so a notch is not taken twice
+    local dir = wheel_key(keys)
+    if dir ~= 0 then
+        if not plugin_counts_wheel() then wheel_rate(dir) end
+        return true
+    end
+    return TimeButton.super.onInput(self, keys)
+end
+
+-- Travel (the world map) and sleep, as the game's own buttons in the bottom
+-- right corner do; those are hidden while the first-person view shows, as
+-- the corner holds the message list.
+TravelSleepButtons = defclass(nil, overlay.OverlayWidget)
+TravelSleepButtons.ATTRS{
+    desc='Adds travel (map) and sleep buttons right of the speed display while the first-person view is shown.',
+    default_enabled=true,
+    default_pos={x=62, y=-4},
+    viewscreens='dungeonmode',
+    frame={w=8, h=3},
+    version=2,
+    visible=view_shown,
+}
+
+-- Paints the game's own 4 x 3 button picture that starts at tile col, row of
+-- its INTERFACE_BITS_ADVENTURE page (graphics_interface.txt); false if the
+-- game has no such picture loaded (no graphics), and nothing is painted.
+local function paint_game_button(dc, col, row)
+    local tiles = {}
+    for y = 0, 2 do
+        for x = 0, 3 do
+            local tile = dfhack.screen.findGraphicsTile('INTERFACE_BITS_ADVENTURE', col + x, row + y)
+            if not tile then return false end
+            tiles[y * 4 + x + 1] = tile
+        end
+    end
+    for y = 0, 2 do
+        for x = 0, 3 do
+            dc:seek(x, y):tile(nil, tiles[y * 4 + x + 1])
+        end
+    end
+    return true
+end
+
+-- the game's ADVENTURE_TRAVEL and ADVENTURE_SLEEP pictures; our art (or
+-- characters) only if the game has none
+function TravelSleepButtons:onRenderBody(dc)
+    local x = self:getMousePos()
+    local travel, sleep = dc:viewport(0, 0, 4, 3), dc:viewport(4, 0, 4, 3)
+    if not paint_game_button(travel, 20, 3) then
+        paint_button(travel, 'button_travel', 4, 3, false, x ~= nil and x < 4, map_chars)
+    end
+    if not paint_game_button(sleep, 24, 3) then
+        paint_button(sleep, 'button_sleep', 4, 3, false, x ~= nil and x >= 4, sleep_chars)
+    end
+end
+
+function TravelSleepButtons:onInput(keys)
+    local x = self:getMousePos()
+    if not x then
+        return TravelSleepButtons.super.onInput(self, keys)
+    end
+    if keys._MOUSE_L then
+        -- the click is ours: the game must not also take it for one on the
+        -- (hidden) map under the button
+        df.global.enabler.mouse_lbut = 0
+        local key = x < 4 and 'A_TRAVEL' or 'A_SLEEP'
+        -- sent from outside the game's input handling, which this is part of
+        dfhack.timeout(1, 'frames', function()
+            if view_shown() then
+                gui.simulateInput(dfhack.gui.getDFViewscreen(true), key)
+            end
+        end)
+        return true
+    end
+    if keys._MOUSE_R or wheel_key(keys) ~= 0 then
+        return true
+    end
+    return TravelSleepButtons.super.onInput(self, keys)
+end
+
+---------------------------------------------------------------------------
+-- the message list in the bottom right corner
+
+-- reports in the list at most
+local MESSAGES_KEPT = 200
+
+-- text broken into lines of at most width characters, at spaces where it can
+local function wrap(text, width)
+    local lines = {}
+    local line = ''
+    for word in text:gmatch('%S+') do
+        while #word > width do
+            if #line > 0 then
+                table.insert(lines, line)
+                line = ''
+            end
+            table.insert(lines, word:sub(1, width))
+            word = word:sub(width + 1)
+        end
+        if #line == 0 then
+            line = word
+        elseif #line + 1 + #word <= width then
+            line = line .. ' ' .. word
+        else
+            table.insert(lines, line)
+            line = word
+        end
+    end
+    if #line > 0 or #lines == 0 then
+        table.insert(lines, line)
+    end
+    return lines
+end
+
+-- The messages the game has shown, oldest first, as lines of the given
+-- width with the game's colours. A long message is stored by the game as
+-- several reports, the later ones marked as continuing it.
+local function message_lines(width)
+    local list = df.global.world.status.announcements
+    local entries = {}
+    for i = math.max(0, #list - MESSAGES_KEPT), #list - 1 do
+        local r = list[i]
+        local text = r.text
+        if r.repeat_count > 0 then
+            text = ('%s x%d'):format(text, r.repeat_count + 1)
+        end
+        local fg = r.color % 8 + (r.bright and 8 or 0)
+        if fg == COLOR_BLACK then fg = COLOR_DARKGREY end
+        local last = entries[#entries]
+        if r.flags.continuation and last then
+            last.text = last.text .. ' ' .. text
+        else
+            table.insert(entries, {text=text, fg=fg})
+        end
+    end
+    local lines = {}
+    for _, e in ipairs(entries) do
+        for _, line in ipairs(wrap(e.text, width)) do
+            table.insert(lines, {text=line, pen={fg=e.fg, bg=COLOR_BLACK}})
+        end
+    end
+    return lines
+end
+
+MessageLines = defclass(nil, widgets.Widget)
+MessageLines.ATTRS{
+    get_lines=DEFAULT_NIL,
+    get_top=DEFAULT_NIL,
+}
+
+function MessageLines:onRenderBody(dc)
+    local lines, top = self.get_lines(), self.get_top()
+    for row = 0, dc.height - 1 do
+        local line = lines[top + row]
+        if not line then break end
+        dc:seek(0, row):string(line.text, line.pen)
+    end
+end
+
+-- Every message of the adventure, newest at the bottom; it scrolls to the
+-- newest when one comes in. The mouse wheel and the scrollbar look back.
+-- It reaches from the right edge to just past the game's action bar, which
+-- sits left of the middle while the view is shown: to the column the plugin
+-- gives as fpview_bar_right when it does, else to a little right of the
+-- middle. Only there while the first-person view is.
+MessagePanel = defclass(nil, overlay.OverlayWidget)
+MessagePanel.ATTRS{
+    desc="Lists the adventure's messages in the bottom right corner while the first-person view is shown.",
+    default_enabled=true,
+    default_pos={x=-1, y=-1},
+    viewscreens={'dungeonmode/Default', 'dungeonmode/ADVENTURE_ARENA'},
+    frame={w=44, h=12},
+    version=1,
+    visible=view_shown,
+}
+
+function MessagePanel:init()
+    self.lines = {}
+    self.top = 1
+    self.follow = true
+    self:addviews{
+        widgets.Panel{
+            frame={t=0, l=0, r=0, b=0},
+            frame_style=gui.FRAME_MEDIUM,
+            frame_background=gui.CLEAR_PEN,
+            subviews={
+                MessageLines{
+                    view_id='text',
+                    frame={t=0, l=0, r=3, b=0},
+                    get_lines=function() return self.lines end,
+                    get_top=function() return self.top end,
+                },
+                widgets.Scrollbar{
+                    view_id='bar',
+                    frame={t=0, r=0, b=0},
+                    on_scroll=self:callback('on_scroll'),
+                },
+            },
+        },
+    }
+end
+
+function MessagePanel:page()
+    local body = self.subviews.text.frame_body
+    return math.max(1, body and body.height or (self.frame.h - 2))
+end
+
+function MessagePanel:scroll(delta)
+    local max_top = math.max(1, #self.lines - self:page() + 1)
+    self.top = math.max(1, math.min(max_top, self.top + delta))
+    self.follow = self.top >= max_top
+end
+
+function MessagePanel:on_scroll(spec)
+    if type(spec) == 'number' then
+        self:scroll(spec - self.top)
+    elseif spec == 'up_small' then
+        self:scroll(-1)
+    elseif spec == 'down_small' then
+        self:scroll(1)
+    elseif spec == 'up_large' then
+        self:scroll(-self:page())
+    elseif spec == 'down_large' then
+        self:scroll(self:page())
+    end
+end
+
+function MessagePanel:render(dc)
+    -- from just right of the action bar to the right edge
+    local parent = self.frame_parent_rect
+    if parent then
+        local left = parent.width // 2 + 2
+        local bar_right = _G.fpview_bar_right
+        if type(bar_right) == 'number' and bar_right > 0 and bar_right < parent.width - 24 then
+            left = math.floor(bar_right) + 1
+        end
+        local w = math.max(24, parent.width - left - 1)
+        if self.frame.w ~= w then self.frame.w = w end
+    end
+    -- the lines again when a message came in or the width changed
+    local list = df.global.world.status.announcements
+    local count = #list
+    local last_id = count > 0 and list[count - 1].id or -1
+    local last_repeat = count > 0 and list[count - 1].repeat_count or 0
+    local body = self.subviews.text.frame_body
+    local width = math.max(8, body and body.width or (self.frame.w - 5))
+    if count ~= self.count or last_id ~= self.last_id or last_repeat ~= self.last_repeat or width ~= self.width then
+        local news = last_id ~= self.last_id or last_repeat ~= self.last_repeat
+        self.count, self.last_id, self.last_repeat, self.width = count, last_id, last_repeat, width
+        self.lines = message_lines(width)
+        if news then self.follow = true end
+    end
+    if self.follow then
+        self.top = math.max(1, #self.lines - self:page() + 1)
+    end
+    local notches = wheel_moved(self)
+    if notches ~= 0 and self:getMouseFramePos() then
+        self:scroll(-2 * notches)
+    end
+    self.subviews.bar:update(self.top, self:page(), math.max(1, #self.lines))
+    MessagePanel.super.render(self, dc)
+end
+
+function MessagePanel:onInput(keys)
+    if not self:getMouseFramePos() then
+        return MessagePanel.super.onInput(self, keys)
+    end
+    local dir = wheel_key(keys)
+    if dir ~= 0 then
+        if not plugin_counts_wheel() then self:scroll(-2 * dir) end
+        return true
+    end
+    if MessagePanel.super.onInput(self, keys) then
+        return true
+    end
+    -- the game's buttons hidden under the panel must not get the clicks
+    return keys._MOUSE_L or keys._MOUSE_R or keys._MOUSE_L_DOWN or keys._MOUSE_R_DOWN or false
+end
+
+-- next to the minimap, top to bottom: "@" draws it in text characters and
+-- back, "+" and "-" zoom it
+MinimapButtons = defclass(nil, overlay.OverlayWidget)
+MinimapButtons.ATTRS{
+    desc='Adds buttons next to the first-person minimap: @ switches it between graphics and text characters, + and - zoom it.',
+    default_enabled=true,
+    default_pos={x=-30, y=3},
+    viewscreens='dungeonmode',
+    frame={w=4, h=9},
+    version=3,
+    visible=minimap_shown,
+}
+
+function MinimapButtons:init()
+    self:addviews{
+        framed_icon('ascii', 0, 'icon_ascii', '@'),
+        framed_icon('zoom_in', 3, 'icon_zoom_in', '+'),
+        framed_icon('zoom_out', 6, 'icon_zoom_out', '-'),
+    }
+end
+
+-- tiles added or taken per zoom click: bigger steps the farther out
+local function zoom_step(tiles)
+    if tiles < 15 then return 2 elseif tiles < 31 then return 4 end
+    return 6
+end
+
+function MinimapButtons:onInput(keys)
+    if keys._MOUSE_L then
+        local views = self.subviews
+        if on_button(views.ascii) then
+            dfhack.run_command_silent('first-person', 'set', 'minimap_ascii', tostring(not config.get('minimap_ascii')))
+            return true
+        elseif on_button(views.zoom_in) then
+            dfhack.run_command_silent('first-person', 'set', 'minimap_tiles',
+                tostring(math.max(5, config.get('minimap_tiles') - zoom_step(config.get('minimap_tiles') - 1))))
+            return true
+        elseif on_button(views.zoom_out) then
+            dfhack.run_command_silent('first-person', 'set', 'minimap_tiles',
+                tostring(math.min(61, config.get('minimap_tiles') + zoom_step(config.get('minimap_tiles')))))
+            return true
+        end
+    end
+    return MinimapButtons.super.onInput(self, keys)
+end
+
+OVERLAY_WIDGETS = {button=CameraButton, timer=TimeButton, travel_sleep=TravelSleepButtons,
+    messages=MessagePanel, minimap_style=MinimapButtons}
+
+---------------------------------------------------------------------------
+-- talking to the plugin
+
+local function plugin(...)
+    local output, status = dfhack.run_command_silent(PLUGIN, ...)
+    return status == CR_OK, output
+end
+
+function plugin_available()
+    return (plugin('status'))
+end
+
+local function require_plugin()
+    if not plugin_available() then
+        qerror(('The %s plugin is not loaded. Copy fpview.plug.dll into <DF>/hack/plugins '
+            .. '(it must be built for your exact DFHack version) and restart the game.'):format(PLUGIN))
+    end
+end
+
+-- hand every stored setting, and the art folder, to the plugin
+function push_settings()
+    if not plugin_available() then return false end
+    local media = media_dir()
+    if media then plugin('media', media) end
+    for _, key in ipairs(config.ORDER) do
+        if config.SCHEMA[key].plugin then
+            plugin('set', key, tostring(config.get(key)))
+        end
+    end
+    return true
+end
 
 ---------------------------------------------------------------------------
 -- hotkey
@@ -100,318 +773,19 @@ function apply_hotkey()
 end
 
 ---------------------------------------------------------------------------
--- on / off
-
-local function get_adventurer()
-    return dfhack.world.getAdventurer()
-end
-
-function set_active(on)
-    if on then
-        if not get_adventurer() then
-            return false, 'the first-person view only works while you control an adventurer'
-        end
-        state.active = true
-        state.snap = true
-        state.dirty = true
-        state.error = nil
-    else
-        state.active = false
-    end
-    return true
-end
-
-function isActive()
-    return state.active
-end
-
----------------------------------------------------------------------------
--- per-frame update
-
-local function daylight()
-    -- 1200 ticks per day; fade around dawn (5-7h) and dusk (18-20h)
-    local hour = (df.global.cur_year_tick % 1200) / 50
-    local function ramp(a, b, x)
-        if x <= a then return 0 end
-        if x >= b then return 1 end
-        return (x - a) / (b - a)
-    end
-    local d = math.min(ramp(5, 7, hour), 1 - ramp(18, 20, hour))
-    return math.floor(d * 16 + 0.5) / 16
-end
-
-local function in_default_adventure_ui()
-    local default_menu = df.ui_advmode_menu and df.ui_advmode_menu.Default or 0
-    if df.global.adventure.menu ~= default_menu then return false end
-    return dfhack.gui.matchFocusString('dungeonmode/Default') or
-        dfhack.gui.matchFocusString('dungeonmode/ADVENTURE_ARENA')
-end
-
-local function angle_diff(to, from)
-    local d = (to - from) % (2 * math.pi)
-    if d > math.pi then d = d - 2 * math.pi end
-    return d
-end
-
-local function draw_compass()
-    local h = state.heading
-    local text = (' %s  %s [%s] %s  %s '):format(
-        DIR_NAMES[(h + 6) % 8], DIR_NAMES[(h + 7) % 8], DIR_NAMES[h],
-        DIR_NAMES[(h + 1) % 8], DIR_NAMES[(h + 2) % 8])
-    local sw = dfhack.screen.getWindowSize()
-    local x = (sw - #text) // 2
-    dfhack.screen.paintString({fg=COLOR_WHITE, bg=COLOR_BLACK}, x, 0, text)
-end
-
-local function update()
-    local adv = get_adventurer()
-    if not adv then
-        state.active = false
-        return
-    end
-    -- menus that need the map (look, aim, travel ...) get the normal view back
-    local default_menu = df.ui_advmode_menu and df.ui_advmode_menu.Default or 0
-    if df.global.adventure.menu ~= default_menu then
-        state.snap = true
-        return
-    end
-
-    local vp = df.global.gps.main_viewport
-    local cols, rows = vp.dim_x, vp.dim_y
-    if cols < 1 or rows < 1 or cols > scene_mod.MAX_COLS then return end
-
-    local cfg = config.all()
-
-    local now = dfhack.getTickCount()
-    local dt = now - (state.last_ms or now)
-    state.last_ms = now
-    if dt < 0 then dt = 0 elseif dt > 250 then dt = 250 end
-
-    -- follow the adventurer
-    local ax, ay, az = adv.pos.x, adv.pos.y, adv.pos.z
-    local snap = state.snap
-    state.snap = false
-    local need_scene, full_scene = false, snap or not state.ax
-    if state.ax ~= ax or state.ay ~= ay or state.az ~= az then
-        if state.ax then
-            local dx, dy = ax - state.ax, ay - state.ay
-            if math.abs(az - state.az) > 1 or math.abs(dx) > 1 or math.abs(dy) > 1 then
-                snap = true
-            elseif not cfg.relative_controls then
-                for i = 0, 7 do
-                    if DIR_DX[i] == dx and DIR_DY[i] == dy then
-                        state.heading = i
-                        break
-                    end
-                end
-            end
-            if az ~= state.az then full_scene = true end
-        else
-            snap = true
-        end
-        state.ax, state.ay, state.az = ax, ay, az
-        need_scene = true
-    end
-
-    -- distance haze: pale by day under the sky, dark at night and underground
-    local light = daylight()
-    local des = dfhack.maps.getTileFlags(ax, ay, az)
-    local haze = (des and des.subterranean) and 0 or math.floor(light * 4 + 0.5) / 4
-    if sprites.set_fog(math.floor(8 + 136 * haze), math.floor(9 + 165 * haze), math.floor(12 + 190 * haze)) then
-        scene_mod.reset()
-        full_scene = true
-        state.dirty = true
-    end
-
-    -- refresh the scene every so often, and right away when something moved
-    local moving = state.moving
-    local interval = moving and SCENE_INTERVAL_MOVING_MS or SCENE_INTERVAL_MS
-    if need_scene or full_scene or now - (state.scene_ms or 0) >= interval or now < (state.scene_ms or 0) then
-        if scene_mod.capture(now / 1000, az, cfg.levels_down, cfg.levels_up, full_scene) then
-            state.dirty = true
-        end
-        state.bills = scene_mod.billboards(az, cfg.levels_down, cfg.levels_up)
-        state.scene_ms = now
-    end
-
-    -- where the camera wants to be
-    local tx, ty = ax + 0.5, ay + 0.5
-    local tang = state.heading * math.pi / 4
-    local teye = az * raycaster.LEVEL_H + raycaster.EYE
-    if scene_mod.ground_at(ax, ay, az) == 'ramp' then
-        teye = teye + raycaster.LEVEL_H / 2
-    end
-    if snap or not cfg.smooth or not state.camx or not state.eye then
-        state.camx, state.camy, state.ang, state.eye = tx, ty, tang, teye
-    else
-        local step = MOVE_SPEED * dt / 1000
-        local dx, dy = tx - state.camx, ty - state.camy
-        local dist = math.sqrt(dx * dx + dy * dy)
-        if dist <= step then
-            state.camx, state.camy = tx, ty
-        else
-            state.camx = state.camx + dx / dist * step
-            state.camy = state.camy + dy / dist * step
-        end
-        local da = angle_diff(tang, state.ang)
-        local astep = TURN_SPEED * dt / 1000
-        if math.abs(da) <= astep then
-            state.ang = tang
-        else
-            state.ang = state.ang + (da > 0 and astep or -astep)
-        end
-        local de = teye - state.eye
-        local estep = CLIMB_SPEED * dt / 1000
-        if math.abs(de) <= estep then
-            state.eye = teye
-        else
-            state.eye = state.eye + (de > 0 and estep or -estep)
-        end
-    end
-    state.moving = state.camx ~= tx or state.camy ~= ty or state.ang ~= tang or state.eye ~= teye
-
-    -- full resolution when standing still, half while the camera is moving
-    local K = math.min(cfg.quality, cfg.max_width // cols)
-    if state.moving and cfg.fast_motion then K = K // 2 end
-    if K < 2 then K = 2 end
-    local pool, err = fbuf.ensure(cols, rows, K)
-    if not pool then
-        error(err)
-    end
-
-    local r = state.rendered or {}
-    if state.dirty or r.K ~= K or r.camx ~= state.camx or r.camy ~= state.camy or r.ang ~= state.ang or
-            r.eye ~= state.eye or r.gen ~= fbuf.generation or r.fov ~= cfg.fov or
-            r.view ~= cfg.view_distance or r.light ~= light then
-        local map_w, map_h = dfhack.maps.getTileSize()
-        local t0 = os.clock()
-        raycaster.render(frame, pool.W, pool.H, scene_mod.stacks, state.bills or {},
-            {x=state.camx, y=state.camy, eye=state.eye, ang=state.ang, fov=cfg.fov, pitch=0},
-            {view_distance=cfg.view_distance, daylight=light, map_w=map_w, map_h=map_h,
-             skip_x=ax, skip_y=ay, skip_z=az})
-        local t1 = os.clock()
-        fbuf.flush(pool, frame)
-        state.render_ms = (t1 - t0) * 1000
-        state.flush_ms = (os.clock() - t1) * 1000
-        state.frames = (state.frames or 0) + 1
-        state.dirty = false
-        r.camx, r.camy, r.ang, r.eye = state.camx, state.camy, state.ang, state.eye
-        r.gen, r.fov, r.view, r.light, r.K = fbuf.generation, cfg.fov, cfg.view_distance, light, K
-        state.rendered = r
-    end
-
-    fbuf.present(pool)
-    if cfg.compass then draw_compass() end
-end
-
----------------------------------------------------------------------------
--- input
-
--- relative offset (in 45 degree steps) for each movement key
-local MOVE_KEYS = {
-    {'A_MOVE_N', 0}, {'A_MOVE_NE', 1}, {'A_MOVE_SE', 3}, {'A_MOVE_S', 4},
-    {'A_MOVE_SW', 5}, {'A_MOVE_NW', 7},
-}
-local TURN_KEYS = {
-    {'A_MOVE_W', -1}, {'A_MOVE_E', 1},
-}
--- "move and climb/descend" variants keep their vertical part
-local VERTICAL_KEYS = {}
-for _, suffix in ipairs{'_UP', '_DOWN'} do
-    for i = 0, 7 do
-        table.insert(VERTICAL_KEYS, {'A_MOVE_' .. DIR_NAMES[i] .. suffix, i, suffix})
-    end
-end
-
-local function send_key(key)
-    local scr = dfhack.gui.getDFViewscreen(true)
-    state.passthrough = true
-    local ok, err = pcall(gui.simulateInput, scr, key)
-    state.passthrough = false
-    if not ok then dfhack.printerr(('first-person: %s'):format(tostring(err))) end
-end
-
-local function handle_input(keys)
-    if not state.active or state.passthrough then return false end
-    if not config.get('relative_controls') then return false end
-    if not in_default_adventure_ui() then return false end
-
-    for _, k in ipairs(TURN_KEYS) do
-        if keys[k[1]] then
-            state.heading = (state.heading + k[2]) % 8
-            return true
-        end
-    end
-    for _, k in ipairs(MOVE_KEYS) do
-        if keys[k[1]] then
-            send_key('A_MOVE_' .. DIR_NAMES[(state.heading + k[2]) % 8])
-            return true
-        end
-    end
-    for _, k in ipairs(VERTICAL_KEYS) do
-        if keys[k[1]] then
-            send_key('A_MOVE_' .. DIR_NAMES[(state.heading + k[2]) % 8] .. k[3])
-            return true
-        end
-    end
-    return false
-end
-
----------------------------------------------------------------------------
--- overlay
-
-FirstPersonOverlay = defclass(FirstPersonOverlay, overlay.OverlayWidget)
-FirstPersonOverlay.ATTRS{
-    desc='Draws adventure mode in first person when toggled with the first-person command.',
-    default_enabled=true,
-    fullscreen=true,
-    viewscreens='dungeonmode',
-    version=1,
-}
-
-function FirstPersonOverlay:render()
-    -- capturing other z-levels makes the game redraw, which lands back here
-    if not state.active or scene_mod.capturing then return end
-    local ok, err = xpcall(update, debug.traceback)
-    if not ok then
-        -- never leave a broken renderer running every frame
-        state.active = false
-        state.error = tostring(err)
-        dfhack.printerr('first-person: view switched off after an error:')
-        dfhack.printerr(state.error)
-    end
-end
-
-function FirstPersonOverlay:onInput(keys)
-    return handle_input(keys)
-end
-
-OVERLAY_WIDGETS = {view=FirstPersonOverlay}
-
----------------------------------------------------------------------------
 -- lifecycle
 
 dfhack.onStateChange[GLOBAL_KEY] = function(sc)
-    if sc == SC_MAP_UNLOADED or sc == SC_WORLD_UNLOADED then
-        state.active = false
-        state.bills = nil
-        state.ax = nil
-        -- texture numbers are reassigned when another world loads
-        sprites.clear()
-        scene_mod.reset()
-        fbuf.release()
-    elseif sc == SC_MAP_LOADED then
-        sprites.clear()
-        scene_mod.reset()
-        state.bills = nil
-        state.ax = nil
-        if config.get('start_enabled') and get_adventurer() then
-            set_active(true)
+    if sc == SC_MAP_LOADED then
+        push_settings()
+        if config.get('start_enabled') and dfhack.world.getAdventurer() then
+            plugin('on')
         end
     end
 end
 
 apply_hotkey()
+push_settings()
 
 if dfhack_flags.module then
     return
@@ -421,13 +795,13 @@ end
 -- command line
 
 local function print_status()
-    print(('First-person view is %s.'):format(state.active and 'ON' or 'off'))
-    if state.error then
-        print('Last error: ' .. state.error)
-    end
-    if state.frames then
-        print(('Frames drawn: %d (last frame: %.1f ms render, %.1f ms upload)')
-            :format(state.frames, state.render_ms or 0, state.flush_ms or 0))
+    require_plugin()
+    local _, output = plugin('status')
+    -- the plugin reports state and timing; settings are listed from here
+    for line in output:gmatch('[^\n]+') do
+        if not line:find('^  fov ') and not line:find('^  relative_controls ') then
+            print(line)
+        end
     end
     print()
     print('Settings (change with "first-person set <setting> <value>"):')
@@ -448,7 +822,9 @@ local function set_setting(key, value)
         apply_hotkey()
         qerror(('"%s" is not a valid key; keeping %s'):format(tostring(value), tostring(previous)))
     end
-    state.dirty = true
+    if config.SCHEMA[key].plugin then
+        plugin('set', key, tostring(config.get(key)))
+    end
     print(('%s = %s'):format(key, tostring(config.get(key))))
 end
 
@@ -456,10 +832,11 @@ local args = {...}
 local cmd = args[1] or 'toggle'
 
 if cmd == 'toggle' or cmd == 'on' or cmd == 'off' then
-    local on = cmd == 'on' or (cmd == 'toggle' and not state.active)
-    local ok, err = set_active(on)
-    if not ok then qerror(err) end
-    print(('First-person view %s.'):format(state.active and 'on' or 'off'))
+    require_plugin()
+    push_settings()
+    local ok, output = plugin(cmd)
+    if not ok then qerror((output:gsub('%s+$', ''))) end
+    print((output:gsub('%s+$', '')))
 elseif cmd == 'status' then
     print_status()
 elseif cmd == 'hotkey' then
@@ -470,11 +847,19 @@ elseif cmd == 'hotkey' then
     end
 elseif cmd == 'set' then
     set_setting(args[2], args[3])
+elseif cmd == 'realtime' then
+    require_plugin()
+    local ok, output = plugin('realtime', args[2] or 'toggle')
+    if not ok then qerror((output:gsub('%s+$', ''))) end
+    print((output:gsub('%s+$', '')))
 elseif cmd == 'reload' then
     config.reload()
     apply_hotkey()
-    state.dirty = true
-    print('Settings reloaded.')
+    push_settings()
+    icon_handles = {}
+    button_pictures = {}
+    if media_dir() then plugin('media', media_dir(), 'reload') end
+    print('Settings and art reloaded.')
 else
     print(dfhack.script_help())
 end

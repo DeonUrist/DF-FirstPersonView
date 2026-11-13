@@ -1,0 +1,6 @@
+# creatures that are one lump
+# body part name = x, y   where its two letters go on blob.png, in pixels of the picture.
+# Several names for one place are separated with "|". Names are the ones the game
+# shows in the "What do you want to aim for?" list. Parts that are not listed here go
+# into the list next to the picture. The picture whose parts fit the creature best is used.
+body | upper body = 48, 50

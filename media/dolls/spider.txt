@@ -1,0 +1,23 @@
+# eight legs, seen from above (SPIDER)
+# body part name = x, y   where its two letters go on spider.png, in pixels of the picture.
+# Several names for one place are separated with "|". Names are the ones the game
+# shows in the "What do you want to aim for?" list. Parts that are not listed here go
+# into the list next to the picture. The picture whose parts fit the creature best is used.
+right first leg = 27, 32
+right first foot = 9, 22
+left first leg = 69, 32
+left first foot = 87, 22
+right second leg = 27, 48
+right second foot = 9, 45
+left second leg = 69, 48
+left second foot = 87, 45
+right third leg = 27, 65
+right third foot = 9, 69
+left third leg = 69, 65
+left third foot = 87, 69
+right fourth leg = 27, 81
+right fourth foot = 9, 92
+left fourth leg = 69, 81
+left fourth foot = 87, 92
+abdomen = 48, 98
+cephalothorax = 48, 52

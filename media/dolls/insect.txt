@@ -1,0 +1,20 @@
+# six legs, seen from above (INSECT)
+# body part name = x, y   where its two letters go on insect.png, in pixels of the picture.
+# Several names for one place are separated with "|". Names are the ones the game
+# shows in the "What do you want to aim for?" list. Parts that are not listed here go
+# into the list next to the picture. The picture whose parts fit the creature best is used.
+right first leg = 27, 32
+right first foot = 9, 22
+left first leg = 69, 32
+left first foot = 87, 22
+right second leg = 27, 56
+right second foot = 9, 57
+left second leg = 69, 56
+left second foot = 87, 57
+right third leg = 27, 81
+right third foot = 9, 92
+left third leg = 69, 81
+left third foot = 87, 92
+abdomen = 48, 96
+thorax = 48, 54
+head = 48, 26
