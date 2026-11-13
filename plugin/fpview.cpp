@@ -24,6 +24,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 #include <set>
 #include <string>
 #include <thread>
@@ -88,6 +89,7 @@
 #include "df/announcements.h"
 #include "df/d_init.h"
 #include "df/report.h"
+#include "df/announcement_type.h"
 #include "df/init.h"
 #include "df/tile_building_occ.h"
 #include "df/tile_occupancy.h"
@@ -172,6 +174,8 @@ decltype(&SDL_RenderClear) sdl_render_clear = nullptr;
 decltype(&SDL_RenderCopy) sdl_render_copy = nullptr;
 decltype(&SDL_RenderDrawRect) sdl_render_draw_rect = nullptr;
 decltype(&SDL_SetRenderDrawColor) sdl_set_render_draw_color = nullptr;
+decltype(&SDL_SetRenderDrawBlendMode) sdl_set_render_draw_blend_mode = nullptr;
+decltype(&SDL_GetRenderDrawBlendMode) sdl_get_render_draw_blend_mode = nullptr;
 decltype(&SDL_GetRenderDrawColor) sdl_get_render_draw_color = nullptr;
 decltype(&SDL_RenderFillRect) sdl_render_fill_rect = nullptr;
 decltype(&SDL_GetMouseState) sdl_get_mouse_state = nullptr;
@@ -210,6 +214,8 @@ bool bind_sdl(color_ostream &out) {
     BIND(SDL_RenderCopy, sdl_render_copy);
     BIND(SDL_RenderDrawRect, sdl_render_draw_rect);
     BIND(SDL_SetRenderDrawColor, sdl_set_render_draw_color);
+    BIND(SDL_SetRenderDrawBlendMode, sdl_set_render_draw_blend_mode);
+    BIND(SDL_GetRenderDrawBlendMode, sdl_get_render_draw_blend_mode);
     BIND(SDL_GetRenderDrawColor, sdl_get_render_draw_color);
     BIND(SDL_RenderFillRect, sdl_render_fill_rect);
     BIND(SDL_GetMouseState, sdl_get_mouse_state);
@@ -532,11 +538,13 @@ bool bar_source(int px, int py, int &opx, int &opy) {
     return false;
 }
 
+bool in_messages(int px, int py);   // the message panel (menu.inc)
+
 bool over_interface(int px, int py) {
     int cx, cy;
     if (!interface_cell(px, py, cx, cy))
         return true;
-    if (in_menu_panel(px, py))
+    if (in_menu_panel(px, py) || in_messages(px, py))
         return true;
     // the portrait's place still belongs to the interface while our doll is drawn there
     if (portrait_ours && cx < 12 && cy >= gps->dimy - 8)
@@ -1882,6 +1890,34 @@ std::mutex fx_mutex;
 std::vector<FxArc> fx_arcs;
 std::vector<FxArrow> fx_arrows;
 std::unordered_map<int32_t, FxNudge> fx_nudges;   // by attacker
+
+// Words floating up from a creature that was struck: "MISS!" in green, the
+// wound in red ("Head: Bruise", "Finger, Left hand: Cut off"), what got stuck
+// in it in purple ("Lower body: stuck iron arrow")
+struct FxText {
+    int32_t unit_id;
+    float x, y, h;           // over its head, map tiles / tile widths
+    bool you;                // on the adventurer: shown under the crosshair
+    std::string text;
+    uint32_t color;
+    int stack;               // how many came just before for the same creature
+    double start;
+};
+constexpr double TEXT_TIME = 1.4;
+std::vector<FxText> fx_texts;
+struct PendingMiss {
+    int32_t target, baseline;
+    size_t stuck;
+    double start;
+};
+std::vector<PendingMiss> fx_misses;
+std::unordered_map<int32_t, int32_t> wounds_seen;               // per creature: its next wound id when last looked
+struct HeadSeen {
+    float x, y, top;   // where its head was last drawn
+    uint32_t frame;
+};
+std::unordered_map<int32_t, HeadSeen> heads_seen;   // per creature (a dead one is not drawn any more)
+std::unordered_map<int32_t, std::vector<int32_t>> stuck_seen;   // per creature: what was stuck in it
 double fx_lunge_start = -10;
 int fx_lunge_hand = 1;
 
@@ -1892,6 +1928,114 @@ struct SeenAttack {
     uint32_t frame;
 };
 std::unordered_map<uint64_t, SeenAttack> seen_attacks;
+
+// a body part's name, short: "Left arm", "Finger, Left hand"
+std::string part_name(const df::unit *u, int bp) {
+    if (!u || !u->body.body_plan || bp < 0 || size_t(bp) >= u->body.body_plan->body_parts.size())
+        return "Body";
+    const df::body_part_raw *part = u->body.body_plan->body_parts[bp];
+    if (!part || part->name_singular.empty() || !part->name_singular[0])
+        return "Body";
+    std::string name = *part->name_singular[0];
+    for (const char *drop : {"first ", "second ", "third ", "fourth ", "fifth ", "upper ", "lower "}) {
+        const size_t at = name.find(drop);
+        // "upper"/"lower" stay where they name the part itself ("upper body", "lower body")
+        if (at != std::string::npos && name.find("body") == std::string::npos)
+            name.erase(at, std::strlen(drop));
+    }
+    const bool digit = part->flags.is_set(df::body_part_raw_flags::DIGIT);
+    if (digit && part->con_part_id >= 0 && size_t(part->con_part_id) < u->body.body_plan->body_parts.size())
+        if (const df::body_part_raw *parent = u->body.body_plan->body_parts[part->con_part_id])
+            if (!parent->name_singular.empty() && parent->name_singular[0]) {
+                std::string p = *parent->name_singular[0];
+                if (!p.empty())
+                    p[0] = char(std::toupper(uint8_t(p[0])));
+                name += ", " + p;
+            }
+    if (!name.empty())
+        name[0] = char(std::toupper(uint8_t(name[0])));
+    return name;
+}
+
+// the worst of what a wound did, in a word or two
+std::string wound_word(const df::unit_wound *w) {
+    bool cut = false, smashed_apart = false, guts = false, compound = false, broken = false, fracture = false,
+         major_artery = false, artery = false, nerve = false, gouged = false, torn = false, sprain = false,
+         bruise = false;
+    int effect = -1;
+    for (const df::unit_wound_layerst *l : w->parts) {
+        if (!l)
+            continue;
+        const auto &f = l->flags1.bits;
+        cut = cut || f.cut || f.edged_damage;
+        smashed_apart = smashed_apart || f.smashed_apart;
+        guts = guts || f.guts_spilled;
+        compound = compound || f.compound_fracture;
+        broken = broken || f.broken;
+        fracture = fracture || f.overlapping_fracture;
+        major_artery = major_artery || f.major_artery;
+        artery = artery || f.artery;
+        nerve = nerve || f.motor_nerve_severed || f.sensory_nerve_severed;
+        gouged = gouged || f.gouged;
+        torn = torn || f.tendon_torn || f.ligament_torn;
+        sprain = sprain || f.tendon_strained || f.ligament_sprained;
+        bruise = bruise || f.smashed || f.tendon_bruised || f.ligament_bruised || f.blunt_shake1 || f.blunt_shake2;
+        for (const df::wound_effect_type e : l->effect_type) {
+            if (e == df::wound_effect_type::Bruise)
+                bruise = true;
+            else if (int(e) > 0 && effect < 0)
+                effect = int(e);
+        }
+    }
+    if (w->flags.bits.severed_part)
+        return cut ? "Cut off" : "Torn off";
+    if (smashed_apart)
+        return "Smashed apart";
+    if (guts)
+        return "Guts spilled";
+    if (compound)
+        return "Compound fracture";
+    if (broken)
+        return "Broken";
+    if (fracture)
+        return "Fracture";
+    if (major_artery)
+        return "Artery opened";
+    if (nerve)
+        return "Nerve severed";
+    if (gouged)
+        return "Gouged";
+    if (torn)
+        return "Torn";
+    if (cut)
+        return artery ? "Cut, bleeding" : "Cut";
+    switch (effect) {
+    case int(df::wound_effect_type::Heat): return "Scorched";
+    case int(df::wound_effect_type::Frostbite): return "Frostbite";
+    case int(df::wound_effect_type::Burn): return "Burn";
+    case int(df::wound_effect_type::Melting): return "Melted";
+    case int(df::wound_effect_type::Boiling): return "Boiled";
+    case int(df::wound_effect_type::Freezing): return "Frozen";
+    case int(df::wound_effect_type::Condensation): return "Condensed";
+    case int(df::wound_effect_type::Necrosis): return "Rotting";
+    case int(df::wound_effect_type::Blister): return "Blister";
+    default: break;
+    }
+    if (artery)
+        return "Bleeding";
+    if (sprain)
+        return "Sprain";
+    return bruise ? "Bruise" : "Hit";
+}
+
+// what is stuck in a creature
+std::vector<std::pair<int32_t, int>> stuck_items(const df::unit *u) {
+    std::vector<std::pair<int32_t, int>> out;
+    for (const df::unit_inventory_item *inv : u->inventory)
+        if (inv && inv->item && inv->mode == df::inv_item_role_type::StuckIn)
+            out.emplace_back(inv->item->id, inv->body_part_id);
+    return out;
+}
 
 // simulation thread, with scene.mutex held, right after the creatures were placed
 void track_combat(df::unit *adv, uint32_t frame) {
@@ -1915,11 +2059,21 @@ void track_combat(df::unit *adv, uint32_t frame) {
         }
     };
     std::lock_guard<std::mutex> lock(fx_mutex);
+    for (const auto &[id, b] : drawn)
+        if (b->sprite) {
+            const fpv::Sprite &sp = *b->sprite;
+            heads_seen[id] = HeadSeen{b->x, b->y,
+                                      b->base + float(sp.y1 - sp.y0) / fpv::TEX * fpv::THING_SCALE * b->scale *
+                                                    (1.0f - b->sink),
+                                      frame};
+        }
     const auto fire = [&](const SeenAttack &s) {
         df::unit *a = df::unit::find(s.attacker);
         df::unit *t = df::unit::find(s.target);
         if (!a)
             return;
+        if (t)
+            fx_misses.push_back(PendingMiss{t->id, s.target_wounds, stuck_items(t).size(), now});
         if (a == adv) {
             fx_lunge_start = now;
             fx_lunge_hand = 1;
@@ -1980,6 +2134,76 @@ void track_combat(df::unit *adv, uint32_t frame) {
     for (FxArrow &ar : fx_arrows)
         if (now - ar.start < 0.6 && adv->body.wound_next_id > ar.baseline)
             ar.red = true;
+
+    // words over a creature, stacked over the ones it got a moment ago
+    const auto say = [&](const df::unit *u, const std::string &text, uint32_t color) {
+        FxText t{};
+        t.unit_id = u->id;
+        where(u, t.x, t.y, t.h);
+        // just over the top of its head, where it was last drawn if it is not now
+        const auto head = heads_seen.find(u->id);
+        if (head != heads_seen.end() && frame - head->second.frame < 600) {
+            t.x = head->second.x;
+            t.y = head->second.y;
+            t.h = head->second.top + 0.05f;
+        } else {
+            t.h += 0.75f;
+        }
+        t.you = u == adv;
+        t.text = text;
+        t.color = color;
+        for (const FxText &o : fx_texts)
+            if (o.unit_id == u->id && now - o.start < 0.5)
+                ++t.stack;
+        t.start = now;
+        fx_texts.push_back(std::move(t));
+    };
+    // new wounds and things newly stuck in creatures nearby, from any attack, shot or throw
+    for (df::unit *u : world->units.active) {
+        if (!u || std::abs(u->pos.z - adv->pos.z) > 2 || std::abs(u->pos.x - adv->pos.x) > 40 ||
+            std::abs(u->pos.y - adv->pos.y) > 40)
+            continue;
+        const auto seen = wounds_seen.find(u->id);
+        if (seen != wounds_seen.end() && u->body.wound_next_id > seen->second)
+            for (const df::unit_wound *w : u->body.wounds)
+                if (w && w->id >= seen->second && !w->parts.empty() && w->parts[0])
+                    say(u, part_name(u, w->parts[0]->body_part_id) + ": " + wound_word(w), fpv::rgb(255, 60, 50));
+        wounds_seen[u->id] = u->body.wound_next_id;
+        std::vector<int32_t> ids;
+        for (const auto &[id, bp] : stuck_items(u)) {
+            ids.push_back(id);
+            const auto old = stuck_seen.find(u->id);
+            if (old != stuck_seen.end() && std::find(old->second.begin(), old->second.end(), id) == old->second.end())
+                if (df::item *item = df::item::find(id)) {
+                    std::string what = Items::getDescription(item, 0, false);
+                    if (!what.empty())
+                        what[0] = char(std::toupper(uint8_t(what[0])));
+                    say(u, part_name(u, bp) + ": stuck " + what, fpv::rgb(205, 90, 255));
+                }
+        }
+        stuck_seen[u->id] = std::move(ids);
+    }
+    // a strike that left no new wound and nothing stuck missed
+    for (auto it = fx_misses.begin(); it != fx_misses.end();) {
+        if (now - it->start < 0.35) {
+            ++it;
+            continue;
+        }
+        // (a strike that killed may leave no new wound either)
+        if (df::unit *t = df::unit::find(it->target)) {
+            if (Units::isDead(t) || t->flags2.bits.killed)
+                say(t, "DEAD!", fpv::rgb(255, 60, 50));
+            else if (t->body.wound_next_id <= it->baseline && stuck_items(t).size() <= it->stuck)
+                say(t, "MISS!", fpv::rgb(70, 230, 90));
+        }
+        it = fx_misses.erase(it);
+    }
+    std::erase_if(fx_texts, [&](const FxText &t) { return now - t.start > TEXT_TIME; });
+    if (frame % 1024 == 0) {
+        std::erase_if(wounds_seen, [](const auto &e) { return !df::unit::find(e.first); });
+        std::erase_if(stuck_seen, [](const auto &e) { return !df::unit::find(e.first); });
+        std::erase_if(heads_seen, [&](const auto &e) { return frame - e.second.frame > 600; });
+    }
     std::erase_if(fx_arcs, [&](const FxArc &a) { return now - a.start > ARC_TIME; });
     std::erase_if(fx_arrows, [&](const FxArrow &a) { return now - a.start > ARROW_TIME; });
     std::erase_if(fx_nudges, [&](const auto &e) { return now - e.second.start > NUDGE_TIME; });
@@ -2752,6 +2976,7 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
         move_bottom_buttons(plain && !debug_noblank);
 
         tidy_top(plain && !debug_noblank);
+        update_messages();
         paint_hint(hint, frame_pointer.px, frame_pointer.py);
 
         if (settings.compass && !compass_picture) {
@@ -2937,6 +3162,17 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
             // Ctrl+R switches the intent; the game does not get that key
             if (swallow_keys && !mouse_buttons_active())
                 return;
+            // a click on the message panel is the panel's; the game must not take it for one on the map
+            if (enabler->mouse_lbut || enabler->mouse_rbut) {
+                int px, py;
+                if (pointer_pixels(px, py) && in_messages(px, py)) {
+                    if (enabler->mouse_lbut)
+                        messages_click(px, py);
+                    enabler->mouse_lbut = 0;
+                    enabler->mouse_rbut = 0;
+                    return;
+                }
+            }
             if (menu_input(input))
                 return;
             // Space while time runs by itself only stops it (the waits sent
@@ -3178,6 +3414,11 @@ void draw_minimap_arrow(SDL_Renderer *sdl, const SDL_Rect &dst, int n, int si, i
         }
     Uint8 cr = 0, cg = 0, cb = 0, ca = 255;
     sdl_get_render_draw_color(sdl, &cr, &cg, &cb, &ca);
+    // half see-through, so the tile under it shows
+    SDL_BlendMode blend_was = SDL_BLENDMODE_NONE;
+    sdl_get_render_draw_blend_mode(sdl, &blend_was);
+    sdl_set_render_draw_blend_mode(sdl, SDL_BLENDMODE_BLEND);
+    constexpr Uint8 ARROW_ALPHA = 128;
     const auto put = [&](int x, int y) {
         const int x0 = int(cx + (x - G / 2.0f) * cell), y0 = int(cy + (y - G / 2.0f) * cell);
         const int x1 = int(cx + (x + 1 - G / 2.0f) * cell), y1 = int(cy + (y + 1 - G / 2.0f) * cell);
@@ -3185,7 +3426,7 @@ void draw_minimap_arrow(SDL_Renderer *sdl, const SDL_Rect &dst, int n, int si, i
         sdl_render_fill_rect(sdl, &r);
     };
     // a dark edge, so that it reads on light ground too
-    sdl_set_render_draw_color(sdl, 0, 0, 0, 255);
+    sdl_set_render_draw_color(sdl, 0, 0, 0, ARROW_ALPHA);
     for (int y = 0; y < G; ++y)
         for (int x = 0; x < G; ++x) {
             if (on[y][x])
@@ -3197,12 +3438,13 @@ void draw_minimap_arrow(SDL_Renderer *sdl, const SDL_Rect &dst, int n, int si, i
             if (edge)
                 put(x, y);
         }
-    sdl_set_render_draw_color(sdl, 255, 255, 255, 255);
+    sdl_set_render_draw_color(sdl, 255, 255, 255, ARROW_ALPHA);
     for (int y = 0; y < G; ++y)
         for (int x = 0; x < G; ++x)
             if (on[y][x])
                 put(x, y);
     sdl_set_render_draw_color(sdl, cr, cg, cb, ca);
+    sdl_set_render_draw_blend_mode(sdl, blend_was);
 }
 
 // the minimap in text characters: a picture made on the simulation thread
@@ -3449,15 +3691,19 @@ inline void blend(uint32_t &dst, int r, int g, int b, float a) {
 
 // the attack crescents and the arrows of strikes at you, into the frame
 // (column by column); (cx, cy) is where the pointer is
-void draw_combat_fx(uint32_t *buf, int W, int H, const fpv::Camera &cam, int cx, int cy) {
+// (doll_x, doll_y): the middle of the top of your own paperdoll, where words about you rise from
+void draw_combat_fx(uint32_t *buf, int W, int H, const fpv::Camera &cam, int cx, int cy, int cell_w, int cell_h,
+                    int doll_x, int doll_y) {
     std::vector<FxArc> arcs;
     std::vector<FxArrow> arrows;
+    std::vector<FxText> texts;
     {
         std::lock_guard<std::mutex> lock(fx_mutex);
         arcs = fx_arcs;
         arrows = fx_arrows;
+        texts = fx_texts;
     }
-    if (arcs.empty() && arrows.empty())
+    if (arcs.empty() && arrows.empty() && texts.empty())
         return;
     const double now = fx_now();
     const float P = std::tan(cam.fov * 3.14159265f / 360.0f);
@@ -3515,6 +3761,48 @@ void draw_combat_fx(uint32_t *buf, int W, int H, const fpv::Camera &cam, int cx,
             }
         }
     }
+
+    // the words, rising and fading, with a dark edge so they read on anything;
+    // the font half as big again as the interface's
+    cell_w = cell_w * 3 / 2;
+    cell_h = cell_h * 3 / 2;
+    if (ui_font_ready && cell_w > 0 && cell_h > 0)
+        for (const FxText &tx : texts) {
+            const float t = float((now - tx.start) / TEXT_TIME);
+            float sx, sy, d;
+            if (tx.you) {
+                sx = float(doll_x);
+                sy = float(doll_y) - 2;
+            } else if (!project(tx.x, tx.y, tx.h, sx, sy, d)) {
+                continue;
+            }
+            sy -= t * H * 0.06f + tx.stack * (cell_h + 2);
+            const float alpha = t < 0.6f ? 1.0f : std::max(0.0f, 1 - (t - 0.6f) / 0.4f);
+            const int x0 = int(sx) - int(tx.text.size()) * cell_w / 2, y0 = int(sy) - cell_h;
+            const auto glyphs = [&](int ox, int oy, int r, int g, int b, float a) {
+                for (size_t i = 0; i < tx.text.size(); ++i) {
+                    const uint8_t *rows = ui_font.rows[uint8_t(tx.text[i])];
+                    for (int yy = 0; yy < cell_h; ++yy) {
+                        const int y = y0 + oy + yy;
+                        if (y < 0 || y >= H)
+                            continue;
+                        const uint8_t bits = rows[yy * 12 / cell_h];
+                        if (!bits)
+                            continue;
+                        for (int xx = 0; xx < cell_w; ++xx) {
+                            const int x = x0 + ox + int(i) * cell_w + xx;
+                            if (x >= 0 && x < W && (bits >> (xx * 8 / cell_w)) & 1)
+                                blend(buf[size_t(x) * H + y], r, g, b, a);
+                        }
+                    }
+                }
+            };
+            for (int oy = -1; oy <= 1; ++oy)
+                for (int ox = -1; ox <= 1; ++ox)
+                    if (ox || oy)
+                        glyphs(ox, oy, 0, 0, 0, 0.8f * alpha);
+            glyphs(0, 0, fpv::px_r(tx.color), fpv::px_g(tx.color), fpv::px_b(tx.color), alpha);
+        }
 
     // an arrow from the pointer towards whoever struck at you
     for (const FxArrow &a : arrows) {
@@ -3731,7 +4019,19 @@ void draw_view(df::renderer_2d_base *r) {
             fx = mx * W / out_w;
             fy = my * H / out_h;
         }
-        draw_combat_fx(frame_buffer.data(), W, H, camera, fx, fy);
+        // the game's font at the interface's size, in the frame's pixels
+        int cell_w = 8, cell_h = 12;
+        if (r->dispx_z > 0 && r->dispy_z > 0) {
+            cell_w = std::max(4, r->dispx_z * W / out_w);
+            cell_h = std::max(6, r->dispy_z * H / out_h);
+        }
+        // your paperdoll sits where the portrait was: the bottom left BODY_COLS x BODY_ROWS cells
+        int doll_x = W / 8, doll_y = H - H / 6;
+        if (r->dispx_z > 0 && r->dispy_z > 0 && gps) {
+            doll_x = (r->origin_x + BODY_COLS * r->dispx_z / 2) * W / out_w;
+            doll_y = (r->origin_y + (gps->dimy - BODY_ROWS) * r->dispy_z) * H / out_h;
+        }
+        draw_combat_fx(frame_buffer.data(), W, H, camera, fx, fy, cell_w, cell_h, doll_x, doll_y);
         draw_held(frame_buffer.data(), W, H, fx, fy);
     }
     renderer->swapRedBlue(frame_buffer.data(), size_t(W) * H);   // our pixels are ABGR
@@ -3748,6 +4048,7 @@ void draw_view(df::renderer_2d_base *r) {
     sync_ui_textures(sdl);
     if (settings.compass)
         draw_compass(sdl, out_w, camera.ang);
+    draw_messages(sdl);
     draw_body(sdl);
     draw_menu(sdl);
     if (look_on || debug_look) {

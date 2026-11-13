@@ -29,7 +29,7 @@ Nothing is written to your saves and the mod does not have to be enabled for a w
 | **timer** button, right of the camera | lets time pass by itself: every second the game moves on by as many ticks as the number on the button (a wait, `.`, is 10 ticks). The border turns gold while it runs. It stops on a second click, on **Space** (that press does nothing else), when a menu or dialog opens, when you fight or a message the game would pause for appears, or when the view goes off. Only there while the view is on |
 | mouse wheel over the timer button | raises (up) or lowers (down) the number, 1 to 99 (`realtime_rate`): by 1 up to 10, then by 5. Works with Alt held too |
 | **travel** and **sleep** buttons, right of the speed display ("Walk") | do what the game's map and sleep buttons do (`T`, `Z`), with the game's own pictures for them. The game's buttons in the bottom right corner (centre on yourself, build, travel, sleep) are hidden while the view is on. The bottom is rearranged: the game's row of buttons right of the portrait and the speed display move up beside the timer (one row with "View your companions", the camera, the timer, then travel and sleep), and the game's action bar from the middle of the bottom moves into the bottom row, right of the portrait |
-| message list, bottom right corner | every message of the adventure in the game's colours, newest at the bottom; it scrolls to a new one when it comes in. The mouse wheel over it (Alt held, with mouse look) or its scrollbar looks back. It reaches from the right edge to just past the game's action bar, which sits at the bottom left while the view is on. Conversation lines are read there: the game's box for new messages and conversation lines at the top of the screen is not shown (unless the game is waiting for you to page through more than fits) |
+| message list, bottom right corner | every message of the adventure in the game's colours, newest at the bottom, on a see-through background; it scrolls to a new one when it comes in. The mouse wheel over it (Alt held, with mouse look) or a click on its scrollbar (above or below the middle: a page back or on) looks back. Four buttons at its top right: a sword (combat messages), a speech bubble (talk) and a box (everything else) show or hide that kind (yellow border: shown, blue: hidden); the down arrow folds the list away, leaving only the newest message and an up arrow in the bottom right corner that brings it back. It reaches from the right edge to just past the game's action bar, which sits at the bottom left while the view is on. Conversation lines are read there: the game's box for new messages and conversation lines at the top of the screen is not shown (unless the game is waiting for you to page through more than fits) |
 | **@**, **+**, **-** next to the minimap | minimap in text characters and back; zoom in; zoom out |
 
 What you hold in your hands is drawn low in the corners of the view. Lying on the ground lowers the camera.
@@ -198,6 +198,10 @@ Fighting is shown in the view:
   between them.
 - When something strikes at you, an arrow points from the pointer towards it, turned with your view:
   white when it missed, red when it wounded you.
+- Words float up over a creature that is struck: a green "MISS!" when a strike left no wound, a red "DEAD!" when it killed, the
+  wound in red as body part and what happened to it ("Head: Bruise", "Left arm: Cut",
+  "Finger, Left hand: Cut off", "Broken", "Torn", "Artery opened", "Burn" ...), and in purple what got
+  stuck in it ("Lower body: stuck iron arrow"). Your own rise from just above your paperdoll (bottom left).
 
 The game's box describing the looked-at tile is moved into the top left corner. The game's list of
 nearby places that was there is shown on the compass instead: each place is a coloured pip on the compass
@@ -207,7 +211,7 @@ away it is, in tiles. The compass is four times as wide as before and shows most
 
 In the top right corner the buttons are replaced by a minimap: the normal top-down map around
 you, drawn by the game itself at a smaller size (`first-person set minimap false` brings the
-buttons back). A small white arrow next to you on it points at the tile a step forward goes to; it keeps its size
+buttons back). A small white arrow next to you on it (half see-through) points at the tile a step forward goes to; it keeps its size
 at every zoom, and the zoom goes out to 61 tiles across.
 
 The creature under the pointer gets a faint disc on the ground around its feet in the same colours

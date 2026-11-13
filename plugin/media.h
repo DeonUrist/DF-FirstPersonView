@@ -36,6 +36,7 @@ struct Media {
     std::string dir;
     Image cursor, crosshair, aim[AIM_COUNT], checkbox_on, checkbox_off, compass, compass_frame, wound_bruise,
         wound_cut;
+    Image msg_icon[5];   // the message panel's buttons: combat, talk, other, hide, show
     std::vector<Doll> dolls;
     int files = 0;      // how many were found
 

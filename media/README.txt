@@ -31,6 +31,11 @@ compass_frame.png   the frame over the strip; transparent where the strip shows 
                     16 in the middle stay as they are, the rest is stretched.
 wound_bruise.png    marks on your own paperdoll (bottom left) where a body part is bruised or cut
 wound_cut.png
+msg_combat.png      the buttons of the message list (bottom right): show combat, talk, everything
+msg_talk.png        else; fold the list away, bring it back. 16 x 12 pixels (two interface cells)
+msg_other.png
+msg_hide.png
+msg_show.png
 checkbox_on.png     the boxes in the attack menu
 checkbox_off.png
 dolls/NAME.png      a paperdoll for the "aim for" menu

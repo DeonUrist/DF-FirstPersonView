@@ -105,6 +105,11 @@ std::shared_ptr<const Media> load_media(const std::string &dir) {
     one("compass_frame.png", m->compass_frame);
     one("wound_bruise.png", m->wound_bruise);
     one("wound_cut.png", m->wound_cut);
+    one("msg_combat.png", m->msg_icon[0]);
+    one("msg_talk.png", m->msg_icon[1]);
+    one("msg_other.png", m->msg_icon[2]);
+    one("msg_hide.png", m->msg_icon[3]);
+    one("msg_show.png", m->msg_icon[4]);
 
     std::error_code ec;
     std::vector<std::string> names;

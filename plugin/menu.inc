@@ -1710,3 +1710,394 @@ void update_menu(const std::function<void()> &redraw, const std::function<void()
         menu_px1 = L.x + L.w - 1;
     }
 }
+
+// the message panel's button pictures when media has none (same as tools/make_media.py)
+const char *const MSG_ICON_ROWS[5][12] = {
+    {"............##..", "...........###..", "..........###...", ".........###....", "........###.....", ".......###......", "..oo..###.......", "...oo###........", "....ooo.........", "...ooooo........", "..oo...oo.......", ".oo............."},
+    {"................", "..###########...", ".#...........#..", ".#.##.###.##.#..", ".#...........#..", ".#.####.###..#..", ".#...........#..", "..####..######..", ".....#.#........", ".....##.........", ".....#..........", "................"},
+    {"................", "..############..", "..#..........#..", "..#..........#..", "..############..", "..#....oo....#..", "..#....oo....#..", "..#..........#..", "..#..........#..", "..############..", "................", "................"},
+    {"................", "......####......", "......####......", "......####......", "......####......", "..############..", "...##########...", "....########....", ".....######.....", "......####......", ".......##.......", "................"},
+    {"................", ".......##.......", "......####......", ".....######.....", "....########....", "...##########...", "..############..", "......####......", "......####......", "......####......", "......####......", "................"},
+};
+
+// ---------------------------------------------------------------------------
+// The message list in the bottom right corner: every message of the
+// adventure, newest at the bottom, on a see-through background. Drawn here
+// in pixels (an interface cell always has a solid background). Buttons at its
+// top right show or hide combat, talk and everything else, and fold it away:
+// then only the newest message shows, with a button to unfold it.
+
+enum { MSG_COMBAT, MSG_TALK, MSG_OTHER };
+
+struct MsgLine {
+    std::string text;
+    uint32_t color;
+};
+struct MsgModel {
+    std::vector<MsgLine> lines;    // shown kinds, wrapped to the panel
+    std::vector<MsgLine> latest;   // the newest shown message, wrapped for the folded panel
+    int width = 0;                 // characters a line holds
+};
+std::mutex msg_mutex;
+std::shared_ptr<const MsgModel> msg_model;
+std::atomic<bool> msg_show[3] = {true, true, true};
+std::atomic<bool> msg_folded{false};
+std::atomic<int> msg_top{0};          // first line shown
+std::atomic<bool> msg_follow{true};   // kept at the newest
+std::atomic<int> msg_page{8};         // lines that fit
+std::atomic<int> msg_shown_version{0};
+
+constexpr int MSG_KEPT = 200;   // messages listed at most
+constexpr int MSG_ROWS = 12;    // the panel's height, in interface cells
+
+// the panel's columns, in interface cells: from just right of the action bar to one short of the right edge
+bool msg_columns(int dimx, int &x0, int &x1) {
+    x0 = dimx / 2 + 2;
+    const int bar_right = moved_bar.live.load() ? moved_bar.x1.load() : -1;
+    if (bar_right > 0 && bar_right < dimx - 24)
+        x0 = bar_right + 1;
+    x1 = dimx - 2;
+    return x1 - x0 >= 20;
+}
+
+std::vector<std::string> msg_wrap(const std::string &text, int width) {
+    std::vector<std::string> out;
+    std::string line;
+    size_t i = 0;
+    while (i < text.size()) {
+        while (i < text.size() && text[i] == ' ')
+            ++i;
+        size_t j = i;
+        while (j < text.size() && text[j] != ' ')
+            ++j;
+        std::string word = text.substr(i, j - i);
+        i = j;
+        if (word.empty())
+            break;
+        while (int(word.size()) > width) {
+            if (!line.empty()) {
+                out.push_back(line);
+                line.clear();
+            }
+            out.push_back(word.substr(0, size_t(width)));
+            word = word.substr(size_t(width));
+        }
+        if (line.empty())
+            line = word;
+        else if (int(line.size() + 1 + word.size()) <= width)
+            line += " " + word;
+        else {
+            out.push_back(line);
+            line = word;
+        }
+    }
+    if (!line.empty() || out.empty())
+        out.push_back(line);
+    return out;
+}
+
+// what kind of message a report is: talk has a speaker, combat is a combat
+// report or one in a creature's combat (sparring, hunting) log
+int msg_kind(const df::report *r, const std::unordered_set<int32_t> &fight_ids) {
+    if (r->speaker_id >= 0)
+        return MSG_TALK;
+    const std::string type = ENUM_KEY_STR(announcement_type, r->type);
+    // fighting that is not called COMBAT_ (falling over, a grip let go, rage gone ...)
+    static const std::unordered_set<std::string> fight_types = {
+        "ADV_CREATURE_DEATH", "FALL_OVER", "STAND_UP", "CANNOT_STAND", "BREAK_GRIP", "NO_BREAK_GRIP",
+        "LOSE_EMOTION", "MOVED_OUT_OF_RANGE", "YOU_YIELDED", "YOU_UNYIELDED", "NO_INV_TO_THROW", "NO_INV_TO_FIRE",
+        "UNIT_PROJECTILE_SLAM", "UNIT_PROJECTILE_SLAM_INTO_UNIT", "UNIT_PROJECTILE_SLAM_BLOW_APART", "PARALYZED",
+        "OVERCOME_PARALYSIS", "NOT_STUNNED", "PAIN_KO", "CAUGHT_IN_WEB", "FREE_FROM_WEB", "SHOOT_WEB", "TRIGGER_WEB",
+        "CAUGHT_IN_FLAMES", "FLAME_HIT", "DODGE_FLYING_OBJECT", "GHOST_ATTACK", "UNDEAD_ATTACK", "COUGH_BLOOD",
+        "VOMIT_BLOOD", "VERMIN_BITE", "YOU_FEED_ON_SUCKEE", "BANDIT_GRAB_ITEM", "BLOCK_FIRE"};
+    if (type.rfind("COMBAT_", 0) == 0 || type.rfind("AMBUSH_", 0) == 0 || fight_types.count(type) ||
+        fight_ids.count(r->id))
+        return MSG_COMBAT;
+    if (type.find("CONVERSATION") != std::string::npos)
+        return MSG_TALK;
+    return MSG_OTHER;
+}
+
+// simulation thread, each frame: the lines again when anything they depend on changed
+void update_messages() {
+    static int seen_count = -1, seen_last = -2, seen_repeat = -1, seen_width = -1, seen_filter = -1;
+    if (!world || !gps)
+        return;
+    int x0, x1;
+    if (!msg_columns(gps->dimx, x0, x1))
+        return;
+    const int width = (x1 - x0 + 1) - 4;   // a margin, and the scrollbar
+    const auto &list = world->status.announcements;
+    const int count = int(list.size());
+    const int last = count ? list[count - 1]->id : -1;
+    const int repeat = count ? list[count - 1]->repeat_count : 0;
+    const int filter = (msg_show[0] ? 1 : 0) | (msg_show[1] ? 2 : 0) | (msg_show[2] ? 4 : 0);
+    if (count == seen_count && last == seen_last && repeat == seen_repeat && width == seen_width &&
+        filter == seen_filter)
+        return;
+    const bool news = last != seen_last || repeat != seen_repeat;
+    seen_count = count;
+    seen_last = last;
+    seen_repeat = repeat;
+    seen_width = width;
+    seen_filter = filter;
+
+    std::unordered_set<int32_t> fight_ids;
+    for (const df::unit *u : world->units.active)
+        if (u)
+            for (int k = 0; k < 3; ++k)
+                for (const int32_t id : u->reports.log[k])
+                    fight_ids.insert(id);
+
+    struct Entry {
+        std::string text;
+        uint32_t color;
+        int kind;
+    };
+    std::vector<Entry> entries;
+    for (int i = std::max(0, count - MSG_KEPT); i < count; ++i) {
+        const df::report *r = list[i];
+        if (!r)
+            continue;
+        std::string text = r->text;   // in the game's own characters, as its font has them
+        if (r->repeat_count > 0)
+            text += " x" + std::to_string(r->repeat_count + 1);
+        if (r->flags.bits.continuation && !entries.empty()) {
+            entries.back().text += " " + text;
+            continue;
+        }
+        int fg = (r->color & 7) + (r->bright ? 8 : 0);
+        if (fg == 0)
+            fg = 8;
+        const uint32_t color = fpv::rgb(gps->uccolor[fg][0], gps->uccolor[fg][1], gps->uccolor[fg][2]);
+        entries.push_back(Entry{text, color, msg_kind(r, fight_ids)});
+    }
+    auto m = std::make_shared<MsgModel>();
+    m->width = width;
+    const Entry *newest = nullptr;
+    for (const Entry &e : entries) {
+        if (!msg_show[e.kind])
+            continue;
+        newest = &e;
+        for (const std::string &l : msg_wrap(e.text, width))
+            m->lines.push_back(MsgLine{l, e.color});
+    }
+    if (newest) {
+        std::vector<std::string> parts = msg_wrap(newest->text, std::max(10, width - 4));
+        if (parts.size() > 3) {
+            parts.resize(3);
+            parts[2] += "...";
+        }
+        for (const std::string &l : parts)
+            m->latest.push_back(MsgLine{l, newest->color});
+    }
+    std::lock_guard<std::mutex> lock(msg_mutex);
+    msg_model = m;
+    if (news)
+        msg_follow = true;
+}
+
+// where everything is, window pixels (from the last drawing)
+struct MsgRect {
+    int x = 0, y = 0, w = 0, h = 0;
+    bool has(int px, int py) const { return w > 0 && px >= x && py >= y && px < x + w && py < y + h; }
+};
+std::mutex msg_rect_mutex;
+MsgRect msg_area, msg_buttons[5], msg_track;   // buttons: combat, talk, other, hide, show
+UiTexture tex_messages;
+std::shared_ptr<const fpv::Image> msg_fallback[5];
+
+const fpv::Image &msg_icon(const fpv::Media *media, int i) {
+    if (media && media->msg_icon[i].ok())
+        return media->msg_icon[i];
+    if (!msg_fallback[i]) {
+        auto img = std::make_shared<fpv::Image>();
+        img->w = 16;
+        img->h = 12;
+        img->px.assign(16 * 12, 0);
+        for (int y = 0; y < 12; ++y)
+            for (int x = 0; x < 16; ++x) {
+                const char c = MSG_ICON_ROWS[i][y][x];
+                if (c == '#')
+                    img->px[size_t(y) * 16 + x] = fpv::rgb(255, 255, 255);
+                else if (c == 'o')
+                    img->px[size_t(y) * 16 + x] = fpv::rgb(255, 214, 90);
+            }
+        msg_fallback[i] = img;
+    }
+    return *msg_fallback[i];
+}
+
+// true if the pointer is on something of the panel
+bool in_messages(int px, int py) {
+    std::lock_guard<std::mutex> lock(msg_rect_mutex);
+    if (msg_area.has(px, py))
+        return true;
+    for (const MsgRect &b : msg_buttons)
+        if (b.has(px, py))
+            return true;
+    return false;
+}
+
+void msg_scroll_to(int top, int total) {
+    const int page = std::max(1, msg_page.load());
+    const int max_top = std::max(0, total - page);
+    top = std::clamp(top, 0, max_top);
+    msg_top = top;
+    msg_follow = top >= max_top;
+}
+
+// simulation thread: a left click at a window pixel; true if it was ours
+bool messages_click(int px, int py) {
+    MsgRect area, buttons[5], track;
+    {
+        std::lock_guard<std::mutex> lock(msg_rect_mutex);
+        area = msg_area;
+        for (int i = 0; i < 5; ++i)
+            buttons[i] = msg_buttons[i];
+        track = msg_track;
+    }
+    for (int i = 0; i < 3; ++i)
+        if (buttons[i].has(px, py)) {
+            msg_show[i] = !msg_show[i];
+            return true;
+        }
+    if (buttons[3].has(px, py)) {
+        msg_folded = true;
+        return true;
+    }
+    if (buttons[4].has(px, py)) {
+        msg_folded = false;
+        msg_follow = true;
+        return true;
+    }
+    if (track.has(px, py)) {
+        std::shared_ptr<const MsgModel> m;
+        {
+            std::lock_guard<std::mutex> lock(msg_mutex);
+            m = msg_model;
+        }
+        const int total = m ? int(m->lines.size()) : 0;
+        const int page = std::max(1, msg_page.load());
+        // a click above the middle of the track pages up, below it down
+        const int dir = py < track.y + track.h / 2 ? -1 : 1;
+        msg_scroll_to(msg_top + dir * page, total);
+        return true;
+    }
+    return area.has(px, py);
+}
+
+// render thread
+void draw_messages(SDL_Renderer *sdl) {
+    static int wheel_seen = 0;
+    const auto clear = [] {
+        std::lock_guard<std::mutex> lock(msg_rect_mutex);
+        msg_area = MsgRect();
+        for (MsgRect &b : msg_buttons)
+            b = MsgRect();
+        msg_track = MsgRect();
+    };
+    std::shared_ptr<const MsgModel> m;
+    {
+        std::lock_guard<std::mutex> lock(msg_mutex);
+        m = msg_model;
+    }
+    Cells c;
+    int cx0, cx1;
+    // only on the plain adventure screen, where the game's corner is hidden
+    if (!m || !ui_font_ready || !corner_live || !get_cells(c) || !msg_columns(c.dimx, cx0, cx1)) {
+        clear();
+        return;
+    }
+    const std::shared_ptr<const fpv::Media> media = get_media();
+    const int cw = c.cw, ch = c.ch;
+    const int bw = 2 * cw + 6, bh = ch + 6;   // a button: a two-cell picture and its border
+    const uint32_t BG = 0xA0000000u | (fpv::rgb(8, 9, 14) & 0x00FFFFFFu);
+    const uint32_t ON = UI_YELLOW, OFF = fpv::rgb(60, 110, 210);
+    const auto button = [&](fpv::Canvas &cv, int x, int y, int icon, bool on) {
+        cv.fill(x, y, bw, bh, 0xD0000000u | (fpv::rgb(14, 16, 24) & 0x00FFFFFFu));
+        cv.frame(x, y, bw, bh, on ? ON : OFF, 2);
+        cv.blitFit(msg_icon(media.get(), icon), x + 3, y + 3, bw - 6, bh - 6);
+    };
+    int mx = -1, my = -1;
+    sdl_get_mouse_state(&mx, &my);
+    const int bottom = c.oy + c.dimy * ch;
+    const int right = c.ox + (cx1 + 1) * cw;
+
+    if (msg_folded) {
+        // the newest message alone, and the button that brings the list back
+        int tw = 0;
+        for (const MsgLine &l : m->latest)
+            tw = std::max(tw, int(l.text.size()) * cw);
+        const int text_w = tw > 0 ? tw + 12 : 0, text_h = int(m->latest.size()) * ch + 8;
+        const int W = text_w + 6 + bw, H = std::max(bh, text_h);
+        fpv::Canvas cv;
+        cv.resize(W, H);
+        if (text_w > 0) {
+            cv.fill(0, H - text_h, text_w, text_h, BG);
+            for (size_t i = 0; i < m->latest.size(); ++i)
+                cv.text(ui_font, 6, H - text_h + 4 + int(i) * ch, m->latest[i].text, m->latest[i].color, cw, ch);
+        }
+        button(cv, W - bw, H - bh, 4, false);
+        tex_messages.upload(sdl, cv.px.data(), cv.w, cv.h);
+        const int x = right - W, y = bottom - H - 2;
+        tex_messages.draw(sdl, x, y);
+        std::lock_guard<std::mutex> lock(msg_rect_mutex);
+        msg_area = MsgRect();
+        for (MsgRect &b : msg_buttons)
+            b = MsgRect();
+        msg_track = MsgRect();
+        msg_buttons[4] = MsgRect{x + W - bw, y + H - bh, bw, bh};
+        return;
+    }
+
+    const int X = c.ox + cx0 * cw, Y = c.oy + (c.dimy - MSG_ROWS) * ch;
+    const int W = right - X, H = bottom - Y;
+    const int text_y = bh + 6, rows = std::max(1, (H - text_y - 4) / ch);
+    msg_page = rows;
+    const int total = int(m->lines.size());
+
+    // the mouse wheel over it looks back
+    const int wheel = wheel_total.load();
+    if (wheel != wheel_seen) {
+        if (mx >= X && my >= Y && mx < X + W && my < Y + H)
+            msg_scroll_to(msg_top - 2 * (wheel - wheel_seen), total);
+        wheel_seen = wheel;
+    }
+    if (msg_follow)
+        msg_top = std::max(0, total - rows);
+    const int top = std::clamp(msg_top.load(), 0, std::max(0, total - rows));
+
+    fpv::Canvas cv;
+    cv.resize(W, H);
+    cv.fill(0, 0, W, H, BG);
+    cv.frame(0, 0, W, H, UI_GOLD, 1);
+    for (int r = 0; r < rows && top + r < total; ++r) {
+        const MsgLine &l = m->lines[size_t(top + r)];
+        cv.text(ui_font, cw, text_y + r * ch, l.text, l.color, cw, ch);
+    }
+    // the scrollbar
+    const int track_x = W - 2 * cw + 2, track_w = cw - 2, track_h = rows * ch;
+    cv.fill(track_x, text_y, track_w, track_h, 0x80000000u | (fpv::rgb(60, 64, 80) & 0x00FFFFFFu));
+    if (total > rows) {
+        const int thumb_h = std::max(ch, track_h * rows / total);
+        const int thumb_y = text_y + (track_h - thumb_h) * top / std::max(1, total - rows);
+        cv.fill(track_x, thumb_y, track_w, thumb_h, fpv::rgb(170, 176, 196));
+    }
+    // the buttons, right to left: fold, everything else, talk, combat
+    int bx[4];
+    for (int i = 0; i < 4; ++i)
+        bx[i] = W - 4 - (4 - i) * bw - (3 - i) * 3;
+    for (int i = 0; i < 3; ++i)
+        button(cv, bx[i], 3, i, msg_show[i]);
+    button(cv, bx[3], 3, 3, false);
+    tex_messages.upload(sdl, cv.px.data(), cv.w, cv.h);
+    tex_messages.draw(sdl, X, Y);
+
+    std::lock_guard<std::mutex> lock(msg_rect_mutex);
+    msg_area = MsgRect{X, Y, W, H};
+    for (int i = 0; i < 4; ++i)
+        msg_buttons[i] = MsgRect{X + bx[i], Y + 3, bw, bh};
+    msg_buttons[4] = MsgRect();
+    msg_track = MsgRect{X + track_x - 2, Y + text_y, track_w + 4, track_h};
+}
