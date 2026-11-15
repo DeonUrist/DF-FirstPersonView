@@ -202,6 +202,9 @@
 #include "df/viewscreen_adventure_logst.h"
 #include "df/site_entryst.h"
 #include "df/adventure_log_mode.h"
+#include "df/army.h"
+#include "df/graphic_map_portst.h"
+#include "df/nemesis_record.h"
 
 #include "media.h"
 #include "render.h"
@@ -375,6 +378,7 @@ struct Settings {
     std::atomic<bool> auto_attack{false};     // walking into a foe strikes it (the game's way)
     std::atomic<int> max_depth{8};          // levels drawn below you
     std::atomic<bool> far_land{true};         // the land beyond the loaded map, from the world map
+    std::atomic<bool> visibility_gradient{true};   // what the adventurer cannot see is dark, indoors a little darker (sight.h)
     std::atomic<float> horizon{20000};        // tiles: how far the far land reaches (and the haze over it)
     std::atomic<float> far_trees{1400};       // tiles: how far stand-ins for trees are drawn on it
     std::atomic<bool> relative_controls{true};
@@ -401,6 +405,11 @@ int last_view_unit = -1;                // the controlled creature while the vie
 // unit is not to be found, and the view did not come back after travel (seen by
 // the owner, 2026-11-15); the figure stays the same.
 int32_t last_view_hf = -1, resume_hf = -1;
+// DFHack calls plugin_onupdate only while is_enabled is true, and that is where
+// the view is brought back: the plugin counts as enabled while it waits to.
+void sync_enabled() {
+    is_enabled = active || resume_unit >= 0 || resume_hf >= 0;
+}
 std::atomic<bool> doll_only{false};     // a screen that needs the map is open: only the paperdoll stays
 std::atomic<int64_t> last_capture_ms{0}; // when the adventure screen last drew itself
 // The adventure screen's game tick: running now, and when it last ended. A
@@ -429,8 +438,7 @@ struct Target {
     uint32_t fog = 0xFF0C0908;
     bool underground = false;   // no sky, no weather
     bool outside = false;       // the adventurer's tile is open to the sky (lightning is seen and heard)
-    fpv::Weather weather;       // the game's (or the one picked to test)
-    int weather_pick = 0;       // which one was picked to test, 0 = the game's
+    fpv::Weather weather;       // the game's weather where you are
     bool valid = false;
     uint32_t snap = 0;          // goes up whenever the camera must jump
 } target;
@@ -546,7 +554,6 @@ HeldItem held[2];                         // 0 = left hand, 1 = right hand
 // testing aids
 std::atomic<bool> debug_noblank{false};   // leave the hidden top-down map in the viewport
 std::atomic<bool> debug_center{true};     // aim clicks at the middle of the map tile
-std::vector<std::string> mouse_log;       // what happened to recent mouse clicks
 
 // statistics
 std::atomic<uint32_t> stat_render_us{0}, stat_upload_us{0}, stat_capture_us{0};
@@ -633,6 +640,24 @@ bool plain_adventure_focus() {
     return plain_focus(Gui::getCurFocus(true));
 }
 
+// The game's travel map with nothing of the game's open over it, while the mod
+// is in use: on (the first steps, the unit still there) or off only for the
+// travel and coming back after it (the unit is gone while travelling, so
+// plugin_onupdate turns the view off and remembers to bring it back).
+bool travel_map_ours() {
+    if (!adventure || adventure->menu != df::ui_advmode_menu::Travel || !(active || resume_hf >= 0 || resume_unit >= 0))
+        return false;
+    const std::vector<std::string> focus = Gui::getCurFocus(true);
+    if (focus.empty())
+        return false;
+    for (const std::string &f : focus)
+        if (f != "dungeonmode/Travel")
+            return false;
+    return true;
+}
+// what the game thread last found, for the render thread
+std::atomic<bool> travel_ours{false};
+
 // The same with a DFHack window over it (the mod's settings, gui/launcher):
 // the game's screen under it is still the plain one, and what the mod does to
 // its interface (hidden corners, moved buttons, the message list) stays.
@@ -650,13 +675,6 @@ float daylight_now() {
 // ---------------------------------------------------------------------------
 // weather
 
-// The weather can be picked from a list for testing (the slider in the
-// settings); 0 is the game's own. The names are shown by the Lua script.
-std::atomic<int> debug_weather{0};
-const char *const WEATHER_NAMES[] = {"None (the game's weather)", "Clear", "Cumulus", "Many cumulus", "Cirrus",
-                                     "Altostratus", "Overcast", "Mist", "Fog", "Thick fog", "Rain", "Storm",
-                                     "Snow", "Blood rain", "Evil cloud"};
-constexpr int WEATHER_PICKS = int(sizeof(WEATHER_NAMES) / sizeof(WEATHER_NAMES[0]));
 
 // the colour of a material in a state (liquid for rain, gas for a cloud)
 uint32_t material_color(int16_t type, int32_t index, df::matter_state state, uint32_t fallback) {
@@ -781,52 +799,6 @@ fpv::Weather read_weather(int x, int y, int z) {
     return w;
 }
 
-// the weather picked for testing over the game's time of day and moon
-void pick_weather(fpv::Weather &w, int pick) {
-    if (pick <= 0 || pick >= WEATHER_PICKS)
-        return;
-    for (float &c : w.cloud)
-        c = 0;
-    w.fog = w.rain = w.snow = w.evil = 0;
-    w.rain_color = w.evil_color = 0;
-    switch (pick) {
-    case 2: w.cloud[fpv::CLOUD_CUMULUS] = 1; break;
-    case 3: w.cloud[fpv::CLOUD_CUMULUS_MANY] = 1; break;
-    case 4: w.cloud[fpv::CLOUD_CIRRUS] = 1; break;
-    case 5: w.cloud[fpv::CLOUD_ALTOSTRATUS] = 1; break;
-    case 6: w.cloud[fpv::CLOUD_STRATUS] = 1; break;
-    case 7: w.fog = 1 / 3.0f; break;
-    case 8: w.fog = 2 / 3.0f; break;
-    case 9: w.fog = 1; break;
-    case 10:
-        w.cloud[fpv::CLOUD_STRATUS] = 1;
-        w.cloud[fpv::CLOUD_NIMBUS] = 0.6f;
-        w.rain = 0.6f;
-        break;
-    case 11:
-        w.cloud[fpv::CLOUD_NIMBUS] = 1;
-        w.cloud[fpv::CLOUD_STRATUS] = 1;
-        w.rain = 1;
-        break;
-    case 12:
-        w.cloud[fpv::CLOUD_STRATUS] = 1;
-        w.snow = 1;
-        break;
-    case 13:
-        w.cloud[fpv::CLOUD_STRATUS] = 1;
-        w.rain = 0.7f;
-        w.rain_color = fpv::rgb(150, 20, 20);
-        break;
-    case 14:
-        w.cloud[fpv::CLOUD_CUMULUS_MANY] = 0.6f;
-        w.cloud[fpv::CLOUD_STRATUS] = 1;
-        w.evil = 0.8f;
-        w.evil_color = fpv::rgb(90, 140, 60);
-        break;
-    default: break;   // 1: clear
-    }
-}
-
 // ---------------------------------------------------------------------------
 // pointer: which tile or creature of the 3D view is the mouse on?
 
@@ -864,6 +836,7 @@ bool interface_cell(int px, int py, int &cx, int &cy) {
 // case the pointer belongs to the interface and not to the 3D view
 int hint_x0 = 0, hint_y0 = 0, hint_x1 = -1, hint_y1 = -1;   // hover box painted last frame
 std::atomic<int> tip_x0{0}, tip_y0{0}, tip_x1{-1}, tip_y1{-1};   // the game's hover box drawn last frame, in cells
+int tip_cx = -1;   // simulation thread: the column the game was shown the pointer in for that box; -1 none
 std::atomic<int> menu_px0{0}, menu_py0{0}, menu_px1{-1}, menu_py1{-1};   // our attack menu, in window pixels
 std::atomic<bool> portrait_ours{false};  // the adventurer's paperdoll is drawn where the portrait was
 std::atomic<int> doll_rows{8};           // interface rows the doll and the bars under it cover, from the bottom
@@ -1041,6 +1014,69 @@ bool game_cell_at(int px, int py) {
     if (!gps || !interface_cell(px, py, cx, cy) || cx < 0 || cy < 0 || cx >= gps->dimx || cy >= gps->dimy)
         return false;
     return grid_cell_drawn(size_t(cx) * gps->dimy + cy);
+}
+
+// Simulation thread: the cells that hold something of the game's own once
+// capture has taken off what the mod replaces (the nearby places, the corners,
+// the bottom buttons), before DFHack draws its widgets. The game works out
+// from the pointer alone which of its buttons is under it and draws that
+// button's caption, hidden or not; so where none of its cells shows, it must
+// not be shown the pointer.
+std::vector<uint8_t> game_cells;
+int game_cells_dimx = 0, game_cells_dimy = 0;
+
+void note_game_cells() {
+    const size_t n = size_t(gps->dimx) * gps->dimy;
+    game_cells.resize(n);
+    for (size_t i = 0; i < n; ++i)
+        game_cells[i] = grid_cell_drawn(i);
+    game_cells_dimx = gps->dimx;
+    game_cells_dimy = gps->dimy;
+}
+
+bool game_shows_cell(int cx, int cy) {
+    if (!gps || cx < 0 || cy < 0 || cx >= gps->dimx || cy >= gps->dimy)
+        return false;
+    if (game_cells_dimx != gps->dimx || game_cells_dimy != gps->dimy)
+        return grid_cell_drawn(size_t(cx) * gps->dimy + cy);
+    return game_cells[size_t(cx) * gps->dimy + cy] != 0;
+}
+
+bool game_shows_at(int px, int py) {
+    int cx, cy;
+    return interface_cell(px, py, cx, cy) && game_shows_cell(cx, cy);
+}
+
+// Where the game is shown the pointer while it is over the view, so that it
+// names the looked-at tile (window pixels, the middle of a map tile): the
+// middle of the screen, or with one of the game's windows there a point
+// halfway to a side; never where the game hides anything of its own (the
+// nearby places reach at most 40 columns in and the top right block halfway
+// down; the bottom band is left alone). The map's window is moved to put the
+// tile under it. Shown where the pointer really is, the game took it for the
+// hidden list of nearby places in the top left, or another button it no
+// longer shows, and drew its caption.
+bool game_pointer_spot(int tile_px, int &ax, int &ay) {
+    if (!gps || !enabler || !enabler->renderer || tile_px <= 0)
+        return false;
+    const auto r = static_cast<df::renderer_2d_base *>(enabler->renderer);
+    if (r->dispx_z <= 0 || r->dispy_z <= 0)
+        return false;
+    const int dimx = gps->dimx, dimy = gps->dimy;
+    const int spots[4][2] = {{dimx / 2, dimy / 2}, {dimx / 4, dimy / 2}, {dimx * 3 / 4, dimy / 2}, {dimx / 2, dimy / 4}};
+    for (const auto &s : spots) {
+        // 36: the minimap's 28 columns (MINI_COLS) and the quest box reaching left of it
+        if (s[0] <= 40 || s[0] >= dimx - 36)
+            continue;
+        const int px = r->origin_x + s[0] * r->dispx_z + r->dispx_z / 2;
+        const int py = r->origin_y + s[1] * r->dispy_z + r->dispy_z / 2;
+        ax = px / tile_px * tile_px + tile_px / 2;
+        ay = py / tile_px * tile_px + tile_px / 2;
+        int cx, cy;
+        if (interface_cell(ax, ay, cx, cy) && !game_shows_cell(cx, cy))
+            return true;
+    }
+    return false;
 }
 
 // empty the interface grid; the game's next draw puts its interface back
@@ -1428,6 +1464,8 @@ std::string describe(const fpv::Pick &p, bool terrain = true) {
     return terrain ? describe_terrain(pos) : std::string();
 }
 
+fpv::Pick jump_pick(int px, int py);   // jump.inc
+
 // The game works out which map tile the mouse is on from the mouse position
 // and the origin of the map window, as if the top-down map were still on
 // screen. While the pointer is over the 3D view this moves the window so that
@@ -1456,8 +1494,10 @@ struct PointerRedirect {
     }
 
     // hide_from_game: keep the game from reacting to the pointer at all (used
-    // when we show our own hover text for what the pointer is on)
-    explicit PointerRedirect(bool hide_from_game = false) {
+    // when we show our own hover text for what the pointer is on). hover: for
+    // the game's hover box only, not a click: over a panel of ours the game gets
+    // no pointer, and over the view it is shown one at game_pointer_spot.
+    explicit PointerRedirect(bool hide_from_game = false, bool hover = false) {
         if (!active || !showing || !gps)
             return;
         int px, py;
@@ -1478,14 +1518,35 @@ struct PointerRedirect {
             state = ON_BAR;
             return;
         }
-        if (over_interface(px, py))
+        if (over_interface(px, py)) {
+            // a panel of ours (the doll, the bars, the message list) over the
+            // game's hidden buttons: the game would caption them
+            if (hover && !game_shows_at(px, py)) {
+                set_mouse(-1, -1, -1, -1);
+                state = HIDDEN;
+            }
             return;
-        const fpv::Pick p = pick_pixels(px, py);
+        }
+        // jumping: the tile on your own level the pointer is over, also in the air
+        const bool jumping = game && game->main_interface.adventure.jump.open;
+        const fpv::Pick p = jumping ? jump_pick(px, py) : pick_pixels(px, py);
         picked = p;
         const int tile_px = gps->viewport_zoom_factor / 4;
+        int sx = 0, sy = 0;
         if (p.valid() && hide_from_game) {
             set_mouse(-1, -1, -1, -1);
             state = HIDDEN;
+        } else if (p.valid() && tile_px > 0 && hover && game_pointer_spot(tile_px, sx, sy)) {
+            save_wx = *window_x;
+            save_wy = *window_y;
+            save_wz = *window_z;
+            *window_x = set_wx = p.x - sx / tile_px;
+            *window_y = set_wy = p.y - sy / tile_px;
+            *window_z = set_wz = p.z;
+            state = SHIFTED;
+            int cx = 0, cy = 0;
+            interface_cell(sx, sy, cx, cy);
+            set_mouse(cx, cy, sx, sy);
         } else if (p.valid() && tile_px > 0) {
             save_wx = *window_x;
             save_wy = *window_y;
@@ -1593,9 +1654,14 @@ struct FramePointer {
             return;
         }
         // over the minimap or the hidden corner buttons: the game gets no pointer, so no hover text for them
-        const bool mini = in_minimap(px, py) || in_corner(px, py) || in_frozen_bar(px, py) || in_cover(px, py);
-        if (!mini && over_interface(px, py))
-            return;
+        bool mini = in_minimap(px, py) || in_corner(px, py) || in_frozen_bar(px, py) || in_cover(px, py);
+        if (!mini && over_interface(px, py)) {
+            if (game_shows_at(px, py))
+                return;
+            // a panel of ours (doll, bars, message list) over buttons of the game's we took off:
+            // shown the pointer, the game would draw their captions
+            mini = true;
+        }
         if (!mini) {
             pick = pick_pixels(px, py);
             over_view = true;
@@ -1683,51 +1749,6 @@ void paint_hint_at(const std::string &text, int x0, int y) {
     hint_y1 = y;
     Screen::paintString(Screen::Pen(' ', COLOR_YELLOW, COLOR_BLACK), x0, y, line);
 }
-
-std::string mouse_flags() {
-    if (!enabler)
-        return "";
-    std::string text;
-    const auto add = [&](const char *name, int value) {
-        if (value)
-            text += std::string(name) + " ";
-    };
-    add("L", enabler->mouse_lbut);
-    add("R", enabler->mouse_rbut);
-    add("Ldown", enabler->mouse_lbut_down);
-    add("Rdown", enabler->mouse_rbut_down);
-    add("Llift", enabler->mouse_lbut_lift);
-    add("Rlift", enabler->mouse_rbut_lift);
-    return text.empty() ? "-" : text;
-}
-
-// testing aid: notes what a call into the game did with a pending click
-struct MouseTrace {
-    const char *where;
-    std::string before, note;
-    bool on;
-    explicit MouseTrace(const char *where_) : where(where_) {
-        on = enabler && (enabler->mouse_lbut || enabler->mouse_rbut);
-        if (on)
-            before = mouse_flags();
-    }
-    void after() {
-        if (!on)
-            return;
-        const std::vector<std::string> focus = Gui::getFocusStrings(Gui::getDFViewscreen(true));
-        note += " => " + (focus.empty() ? std::string("?") : focus[0]);
-    }
-    ~MouseTrace() {
-        if (!on)
-            return;
-        if (mouse_log.size() > 80)
-            mouse_log.erase(mouse_log.begin(), mouse_log.begin() + 40);
-        mouse_log.push_back(std::string(where) + ": " + before + "-> " + mouse_flags() + " window " +
-                            std::to_string(*window_x) + "," + std::to_string(*window_y) + "," +
-                            std::to_string(*window_z) + " mouse " + std::to_string(gps->mouse_x) + "," +
-                            std::to_string(gps->mouse_y) + " " + note);
-    }
-};
 
 bool mouse_buttons_active() {
     return enabler && (enabler->mouse_lbut || enabler->mouse_rbut || enabler->mouse_mbut ||
@@ -3008,10 +3029,16 @@ void remove_bottom_buttons(bool plain, bool like_plain = false) {
     (void)like_plain;
     // First what is drawn exactly as on the plain screen (the action bar, under
     // a unit sheet): it can touch the window's edge and would be taken for part of it.
+    // Only the lower layer, where it lies: the game draws some windows (abilities,
+    // crafting) in its top layer over the bar, and taking the cell from both
+    // layers cut their bottom rows off. A blank (a space between the speed
+    // display's words) is left: a window's empty inside can be the same.
     if (bottom_gone_dimx == dimx && bottom_gone_dimy == dimy)
-        for (const GridCell &c : bottom_gone)
-            if (same(read_cell(c.idx), c))
-                take_cell(c.idx);
+        for (const GridCell &c : bottom_gone) {
+            const GridCell now = read_cell(c.idx);
+            if (same(now, c) && (now.tex || now.lower || now.anchored || (now.screen[0] > 32 && now.screen[0] < 255)))
+                write_cell(c.idx, GridCell());
+        }
     const int band_top = std::max(0, dimy - (12 + std::max(4, passing_rows.load())));
     const auto used = [&](int idx) { return cell_used(idx) || top_cell_used(idx); };
     const auto lettered = [&](int idx) {
@@ -3874,7 +3901,9 @@ void track_combat(df::unit *adv, uint32_t frame) {
 #include "gamestyle.inc"
 #include "panels.inc"
 #include "journal.inc"
+#include "travelmap.inc"
 #include "radial.inc"
+#include "jump.inc"
 
 uint32_t last_curtick = 0;   // the tick the game was last drawn for
 
@@ -3963,10 +3992,6 @@ int32_t creature_near_click(int px, int py, const df::coord *tile, const df::uni
     return -1;
 }
 
-// A click is ours from the press to the release of the button: the game
-// must not see the button still held or let go, or it does what a plain click
-// there does (with an arrow on the string: shoot at once).
-int swallow_left = 0;       // frames left in which the rest of that click is kept from the game
 const char *tile_list_refused = "";   // what is said when the step (step_onto) is not offered
 
 // the game moved its map window during the frame's first draw
@@ -3990,17 +4015,6 @@ uint64_t viewport_print(const df::graphic_viewportst *vp) {
         hash = (hash ^ c) * 1099511628211ull;
     }
     return any ? hash : 0;   // 0: nothing drawn at all
-}
-
-void swallow_rest_of_click() {
-    if (swallow_left <= 0 || !enabler)
-        return;
-    const bool lifted = enabler->mouse_lbut_lift != 0;
-    enabler->mouse_lbut = 0;
-    enabler->mouse_lbut_down = 0;
-    enabler->mouse_lbut_lift = 0;
-    if (lifted)
-        swallow_left = 0;
 }
 
 int strike_ticks = 0;       // ticks waited for the strike that is on its way (strike_step)
@@ -4063,6 +4077,13 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
             // below it on yours. The cursor is put on the clicked tile's level.
             if (game && game->main_interface.adventure.aim_projectile.open) {
                 auto &cursor = game->main_interface.adventure.aim_projectile.cursor;
+                cursor.x = redirect->picked.x;
+                cursor.y = redirect->picked.y;
+                cursor.z = redirect->picked.z;
+            }
+            // the same for a jump (the clicked tile is on your level already)
+            if (game && game->main_interface.adventure.jump.open) {
+                auto &cursor = game->main_interface.adventure.jump.cursor;
                 cursor.x = redirect->picked.x;
                 cursor.y = redirect->picked.y;
                 cursor.z = redirect->picked.z;
@@ -4154,6 +4175,16 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
 
     // Input while our attack menu is up; true if it was dealt with here. What
     // is clicked in our menu is clicked in the game's own (unseen) list.
+    // the pointer is on the paperdoll or attack menu's panel
+    static bool on_menu_panel() {
+        const std::shared_ptr<const MenuModel> m = get_menu();
+        if (!m || !menu_state.on || !game)
+            return false;
+        int px, py;
+        MenuLayout L;
+        return pointer_pixels(px, py) && layout_menu(*m, L) && L.contains(px, py);
+    }
+
     bool menu_input(std::set<df::interface_key> *input) {
         const std::shared_ptr<const MenuModel> m = get_menu();
         if (!m || !menu_state.on || !game)
@@ -4210,8 +4241,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
         }
         if (row)
             click_cell(row->x + 3, row->y);
-        mouse_log.push_back(std::string("menu: ") + (option ? m->options[it.index].label : m->entries[it.index].name) +
-                            (row ? " clicked" : " not found on the game's page"));
         if (menu_kind_now(ranged) == kind && ranged == menu_state.ranged)
             menu_scroll() = 0;
         tidy_map();
@@ -4267,7 +4296,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
                 continue;
             if (at != std::string::npos) {
                 click_cell(int(at) + 1, y);
-                mouse_log.push_back("attack: chose '" + name + "'");
                 return true;
             }
         }
@@ -4418,7 +4446,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
             attack_busy = false;
         } else {
             hide_option_list();
-            mouse_log.push_back("attack: the shot's entry was not found in the game's list");
         }
         return true;
     }
@@ -4529,16 +4556,12 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
                     hide_option_list();
                     attack.stage = 13;
                     attack.frames = 6000;
-                    mouse_log.push_back("attack: quick or aimed, asked at the pointer");
                     return;
                 }
                 // one way to do it to the creature that was clicked: that one,
                 // whoever else the list names
                 if (choice && ways == 1 && (named || list.option.size() <= 2))
                     click_option(choice);
-                else
-                    mouse_log.push_back("attack: " + std::to_string(list.option.size()) +
-                                        " ways to do it, left to the player");
                 attack.frames = 0;
             } else if (!aim.open) {
                 attack.frames = 0;      // gone off already
@@ -4587,7 +4610,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
                         enabler->tracking_on = was_tracking;
                         debug_px = dbx;
                         debug_py = dby;
-                        mouse_log.push_back("attack: clicked the target");
                     } else {
                         // the view has moved on: aim at the place instead
                         df::coord pos = attack.target;
@@ -4596,7 +4618,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
                         aim.cursor = pos;
                         std::set<df::interface_key> keys{SELECT};
                         INTERPOSE_NEXT(feed)(&keys);
-                        mouse_log.push_back("attack: aimed at the place");
                     }
                 }
             }
@@ -4673,13 +4694,11 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
                     attack.frames = 30;
                 } else {
                     flash("Cannot load now");
-                    mouse_log.push_back("load: no list for your own tile");
                     attack.frames = 0;
                 }
             } else {
                 std::set<df::interface_key> keys{A_NOCK};
                 INTERPOSE_NEXT(feed)(&keys);
-                mouse_log.push_back("nock: pressed the game's key");
                 attack.stage = 21;
                 attack.waited = 0;
                 attack.frames = 20;
@@ -4690,7 +4709,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
                 attack.frames = 0;      // begun, or the game asks which arrow: the player's choice
             } else if (attack.waited > 6) {
                 flash("Nothing to nock");
-                mouse_log.push_back("nock: nothing came of it");
                 attack.frames = 0;
             }
         } else if (attack.stage == 24) {
@@ -4711,7 +4729,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
                     std::set<df::interface_key> keys{LEAVESCREEN};
                     INTERPOSE_NEXT(feed)(&keys);
                     flash(choice ? "Cannot load now" : "Nothing to load");
-                    mouse_log.push_back(choice ? "load: its entry is not on screen" : "load: not offered");
                     attack.frames = 0;
                 }
             } else if (!list.open) {
@@ -4721,10 +4738,8 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
             if (unload_weapon(adv)) {
                 // the next thing to do with the crossbow is to load it again or shoot
                 set_intent(INTENT_SHOOT, false);
-                mouse_log.push_back("unload: put the bolt away");
             } else {
                 flash("Cannot unload now");
-                mouse_log.push_back("unload: the bolt could not be moved");
             }
             attack.frames = 0;
         } else if (attack.stage == 22) {
@@ -4734,7 +4749,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
                 attack.frames = 30;
             } else {
                 flash("Cannot unnock now");
-                mouse_log.push_back("unnock: no list for your own tile");
                 attack.frames = 0;
             }
         } else if (attack.stage == 23) {
@@ -4752,7 +4766,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
                     std::set<df::interface_key> keys{LEAVESCREEN};
                     INTERPOSE_NEXT(feed)(&keys);
                     flash("Cannot unnock now");
-                    mouse_log.push_back(choice ? "unnock: its entry is not on screen" : "unnock: not offered");
                     attack.frames = 0;
                 }
             } else if (!list.open) {
@@ -4885,7 +4898,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
                 INTERPOSE_NEXT(feed)(&leave);
                 flash(tile_list_refused);
             }
-            mouse_log.push_back(std::string("step: ") + (stepped ? "taken from the game's list" : "not offered"));
             attack.frames = 0;
             return;
         }
@@ -4911,7 +4923,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
             redraw_hidden();
             const bool clicked = click_option(use);
             tidy_map();
-            mouse_log.push_back(std::string("use: ") + (clicked ? "picked" : "entry not found on screen"));
             return;
         }
         if (uses > 1 || others > 0)
@@ -4962,7 +4973,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
         std::set<df::interface_key> keys{A_TALK};
         INTERPOSE_NEXT(feed)(&keys);
         if (!game->main_interface.adventure.conversation.open) {
-            mouse_log.push_back("talk: the game opened no dialog");
             return;
         }
         attack.unit_id = unit->id;
@@ -4983,7 +4993,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
         if (attack.stage == 30) {
             click_tile(unit->pos, false);
             attack.stage = 31;
-            mouse_log.push_back("talk: clicked " + std::to_string(unit->pos.x) + "," + std::to_string(unit->pos.y) + " options " + std::to_string(conv.select_option.size()));
             return;
         }
         df::adventure_optionst *choice = nullptr, *going_on = nullptr;
@@ -5003,7 +5012,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
             redraw_hidden();
             const bool clicked = click_listed(conv.select_option, choice);
             tidy_map();
-            mouse_log.push_back(std::string("talk: ") + (clicked ? "started" : "entry not found on screen"));
             attack.frames = 0;
             return;
         }
@@ -5014,7 +5022,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
             std::set<df::interface_key> leave{LEAVESCREEN};
             INTERPOSE_NEXT(feed)(&leave);
             flash("Cannot talk to " + Units::getReadableName(unit) + " now");
-            mouse_log.push_back("talk: not offered");
             attack.frames = 0;
         }
     }
@@ -5097,7 +5104,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
             game->main_interface.adventure.option_list.open || !game_takes_input(adv))
             return;
         pending_click.on = false;
-        mouse_log.push_back("click: carried out after the game was busy");
         carry_out(pending_click.intent, pending_click.unit_id, pending_click.target, pending_click.px,
                   pending_click.py);
     }
@@ -5141,7 +5147,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
             // "Really start a conflict with ...?": yes, that is what Ctrl-click means
             std::set<df::interface_key> keys{A_ATTACK_CONFIRM};
             INTERPOSE_NEXT(feed)(&keys);
-            mouse_log.push_back("attack: confirmed");
             attack.frames = std::max(attack.frames, 30);
         } else if (attack.stage == 1 && prompt.open && prompt.mode == Mode::MOVE_CHOICE) {
             // strike or wrestle: the intent has decided that already; or
@@ -5158,12 +5163,10 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
             if (seen % 4 != 1) {
                 // waiting for the dialog to take clicks, or for the last one to work
             } else if (seen > 16) {
-                mouse_log.push_back("attack: the move question did not take the click; left to the player");
                 attack.frames = 0;
             } else if (std::find(prompt.move_choice.begin(), prompt.move_choice.end(), wanted) ==
                        prompt.move_choice.end()) {
                 flash(dodge ? "Cannot dodge now" : wrestle ? "Cannot wrestle now" : "Cannot strike now");
-                mouse_log.push_back("attack: the wanted move is not offered");
                 attack.frames = 0;
             } else {
                 std::vector<ScreenRow> rows;
@@ -5174,7 +5177,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
                 for (const ScreenRow &r : rows)
                     if (r.name.rfind(word, 0) == 0) {
                         click_cell(r.x + 3, r.y);
-                        mouse_log.push_back("attack: chose " + word);
                         break;
                     }
             }
@@ -5209,7 +5211,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
                 hide_option_list();
                 attack.stage = 2;
                 attack.frames = 6000;
-                mouse_log.push_back("attack: quick or aimed strike, asked at the pointer");
                 attack.driving = false;
                 attack_busy = true;
                 return;
@@ -5221,7 +5222,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
                 std::set<df::interface_key> keys{LEAVESCREEN};
                 INTERPOSE_NEXT(feed)(&keys);
                 flash(attack.intent == INTENT_WRESTLE ? "Too far to wrestle" : "Too far to strike");
-                mouse_log.push_back("attack: nothing fitting among " + std::to_string(list.option.size()) + " options");
                 attack.frames = 0;
             } else if (click_option(choice)) {
                 attack.stage = 1;
@@ -5230,9 +5230,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
             }
         }
         attack.driving = false;
-        if (attack.frames == 1 && attack.stage < 10)
-            mouse_log.push_back("attack: gave up at stage " + std::to_string(attack.stage) + " menu " +
-                                std::to_string(int(adventure->menu)));
         attack_busy = attack.frames > 0;
     }
 
@@ -5453,6 +5450,37 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
             frame_read_us += pt.us();
         }
 
+        // The light: read again when the game's line of sight may have changed
+        // (a tick passed, you moved, the drawn levels changed), and every half second.
+        {
+            static int32_t sight_tick = -1;
+            static int sight_key[7] = {};
+            static uint32_t sight_frame = 0;
+            static fpv::SightMap sight_new;
+            const bool want = settings.visibility_gradient;
+            const int radius = int(settings.view_distance.load()) + 6;
+            const int key[7] = {ax, ay, az, zlo, zhi, int(world->map.region_x * 4096 + world->map.region_y), radius};
+            if (!want) {
+                if (scene.sight.on) {
+                    std::lock_guard<std::mutex> lock(scene.mutex);
+                    scene.sight.on = false;
+                }
+                sight_tick = -1;
+            } else if (!scene.sight.on || *cur_year_tick != sight_tick || !std::equal(key, key + 7, sight_key) ||
+                       capture_frame - sight_frame >= 30) {
+                const ProbeTimer pt;
+                fpv::readSight(sight_new, ax, ay, zlo, zhi, radius, daylight_now());
+                {
+                    std::lock_guard<std::mutex> lock(scene.mutex);
+                    std::swap(scene.sight, sight_new);
+                }
+                sight_tick = *cur_year_tick;
+                std::copy(key, key + 7, sight_key);
+                sight_frame = capture_frame;
+                frame_read_us += pt.us();
+            }
+        }
+
         bool snap = false;
         if (last_ax >= 0) {
             const int dx = ax - last_ax, dy = ay - last_ay;
@@ -5504,9 +5532,7 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
         const bool underground = des && des->bits.subterranean;
         const float haze = underground ? 0.0f : light;
         const uint32_t fog = fpv::rgb(int(8 + 136 * haze), int(9 + 165 * haze), int(12 + 190 * haze));
-        const int pick = debug_weather.load();
-        fpv::Weather weather = read_weather(ax, ay, az);
-        pick_weather(weather, pick);
+        const fpv::Weather weather = read_weather(ax, ay, az);
 
         {
             std::lock_guard<std::mutex> lock(target_mutex);
@@ -5520,7 +5546,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
             target.underground = underground;
             target.outside = des && des->bits.outside;
             target.weather = weather;
-            target.weather_pick = pick;
             target.valid = true;
             if (snap)
                 ++target.snap;
@@ -5536,6 +5561,7 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
         look_ok = plain_adventure_focus() && game &&
                   !game->main_interface.adventure.option_list.open && !jr_up && !jr.want && !inv_up &&
                   panel_switch.load() < 0 && !radial_open && !radial_config_open && msg_drag.load() < 0;
+        jump_update(adv);
         can_shoot = update_held(adv, capture_frame % 16 == 1);
         if (capture_frame % 4 == 1)
             update_body(adv);
@@ -5595,16 +5621,25 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
             const fpv::Pick &p = frame_pointer.pick;
             const bool aimed = frame_pointer.hidden && frame_pointer.over_view && p.valid() && tile_px > 0 &&
                                settings.game_tips;
+            // where the game is shown the pointer for its box (game_pointer_spot)
+            int aim_cx = 0, aim_cy = 0;
+            tip_cx = -1;
             if (aimed) {
                 // the pointer in the middle of its tile: where exactly the
                 // game's main thread puts it meanwhile then makes no difference
-                const int px = frame_pointer.px / tile_px * tile_px + tile_px / 2;
-                const int py = frame_pointer.py / tile_px * tile_px + tile_px / 2;
-                *window_x = p.x - frame_pointer.px / tile_px;
-                *window_y = p.y - frame_pointer.py / tile_px;
+                int px = frame_pointer.px / tile_px * tile_px + tile_px / 2;
+                int py = frame_pointer.py / tile_px * tile_px + tile_px / 2;
+                int sx = 0, sy = 0;
+                if (game_pointer_spot(tile_px, sx, sy)) {
+                    px = sx;
+                    py = sy;
+                }
+                *window_x = p.x - px / tile_px;
+                *window_y = p.y - py / tile_px;
                 *window_z = p.z;
-                int cx = 0, cy = 0;
+                int &cx = aim_cx, &cy = aim_cy;
                 interface_cell(px, py, cx, cy);
+                tip_cx = cx;
                 gps->mouse_x = cx;
                 gps->mouse_y = cy;
                 gps->precise_mouse_x = px;
@@ -5625,9 +5660,7 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
             }
             inventory_grid_capture();
             if (aimed && plain && !tip_base.empty()) {
-                int mcx = 0, mcy = 0;
-                interface_cell(frame_pointer.px, frame_pointer.py, mcx, mcy);
-                tip_measure(mcx, mcy);
+                tip_measure(aim_cx, aim_cy);
             }
             else
                 tip_none();
@@ -5683,6 +5716,8 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
         tidy_top(plain && !debug_noblank);
         if (!plain && !debug_noblank)
             hide_nearby_again();
+        // what of the game's is left on the screen, before anything of ours is painted on the grid
+        note_game_cells();
         update_messages();
         paint_hint(hint, frame_pointer.px, frame_pointer.py);
         // over a bar of the doll: what it stands at, of how much
@@ -5805,11 +5840,17 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
             close_menu();
             inv_up = false;
             inv_drag = -1;
-            jr_close();
+            // while travelling the view is off (no unit) but the travel map keeps
+            // the tracked marks and the journal panel
+            const bool travel = travel_map_ours();
+            if (!travel)
+                jr_close();
             INTERPOSE_NEXT(render)(curtick);
+            travel_frame();
+            if (travel)
+                journal_frame(Gui::getCurViewscreen(true) == static_cast<df::viewscreen *>(this));
             return;
         }
-        MouseTrace trace("render");
         const ProbeTimer whole_frame;
         {
             static std::chrono::steady_clock::time_point last_render;
@@ -5823,8 +5864,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
         last_curtick = curtick;
         last_capture_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
-        if (swallow_left > 0)
-            --swallow_left;
         if (showing) {
             dismiss_announcements();
             dismiss_popups();
@@ -5852,6 +5891,7 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
         frame_pointer.end();
         update_menu([this] { redraw_hidden(); }, [] { tidy_map(); });
         inventory_frame();
+        travel_frame();
         journal_frame(Gui::getCurViewscreen(true) == static_cast<df::viewscreen *>(this));
         drive_attack();
         leave_aim_step();
@@ -5891,25 +5931,23 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
 
     DEFINE_VMETHOD_INTERPOSE(void, logic, ()) {
         const ProbeTimer ours;
-        if (!attack.driving)
-            swallow_rest_of_click();
         // what the inventory panel asks of the game (never from inside the drawing)
         inventory_logic();
         panels_logic();
         // the camera on the ring (Tab): back to the normal view, as the command does
         if (radial_view_off.exchange(false) && active)
             set_active(Core::getInstance().getConsole(), false);
-        MouseTrace trace("logic");
         // The game works out what its hover box says here, from where the
         // pointer is on its top-down map. So for this step that map is slid to
         // put the tile the pointer is on in the 3D view under the pointer
         // (nothing under it: the pointer is hidden from the game).
+        // Without the game's tips the pointer over the view is only hidden: the
+        // game, shown it, decides which of its buttons is under it from its own
+        // layout, and draws the caption of one we took off (nearby places,
+        // bottom buttons).
         std::unique_ptr<PointerRedirect> aim_tip;
-        int px = -1, py = -1;
-        int bar_px, bar_py;
-        const bool on_corner = pointer_pixels(px, py) && (in_corner(px, py) || bar_source(px, py, bar_px, bar_py));
-        if (active && showing && (settings.game_tips || on_corner) && !debug_noblank && !attack.driving && !inv_up && !jr_up)
-            aim_tip = std::make_unique<PointerRedirect>();
+        if (active && showing && !debug_noblank && !attack.driving && !inv_up && !jr_up)
+            aim_tip = std::make_unique<PointerRedirect>(!settings.game_tips, true);
         const uint32_t ours_us = ours.us();
         const ProbeTimer theirs;
         in_game_tick = true;
@@ -5929,8 +5967,19 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
     DEFINE_VMETHOD_INTERPOSE(void, feed, (std::set<df::interface_key> *input)) {
         if (hitch_on && input && !input->empty())
             hitch("feed key " + std::to_string(int(*input->begin())) + (input->size() > 1 ? " +" : ""));
-        if (!attack.driving)
-            swallow_rest_of_click();
+        // the travel map: the journal panel takes everything while it is up, and
+        // the travel map's journal key and button open it instead of the game's journal
+        if (!showing && travel_map_ours()) {
+            if (const int j = journal_input(input)) {
+                if (j == 2) {
+                    std::set<df::interface_key> keys{df::interface_key::A_TRAVEL_LOG};
+                    INTERPOSE_NEXT(feed)(&keys);
+                }
+                return;
+            }
+            if (journal_key(input))
+                return;
+        }
         if (active && showing && !attack.driving) {
             // the inventory panel takes the mouse while it is up
             if (inventory_input(input))
@@ -5956,6 +6005,12 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
                 if (r)
                     return;
             }
+            // A click on the paperdoll or attack menu is the menu's, before the
+            // message panel and the squares along the bottom: the menu reaches down
+            // over them, and the feet of the aimed-strike doll lie there (their
+            // clicks went to the message panel and were lost).
+            if (enabler->mouse_lbut && on_menu_panel() && menu_input(input))
+                return;
             // A click on the doll's square opens your sheet, wherever on the square it
             // lands; the square is larger than the game's portrait under it, and a
             // click beside the portrait went to the game's hidden buttons there
@@ -6067,7 +6122,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
             }
         }
         // clicks act on what the pointer is on in the 3D view
-        MouseTrace trace("feed");
         std::unique_ptr<PointerRedirect> redirect;
         // where the pointer is before the click is aimed through the view
         int click_px = -1, click_py = -1;
@@ -6106,7 +6160,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
                     if (df::unit *near_unit = near_id >= 0 ? df::unit::find(near_id) : nullptr) {
                         unit_id = near_id;
                         target = near_unit->pos;
-                        mouse_log.push_back("click: snapped to the creature beside it");
                     }
                 }
                 if (combat_intent(click_intent) && !no_target && unit_id < 0) {
@@ -6131,13 +6184,10 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
                         target = adv->pos;
                     } else if (click_intent != INTENT_THROW || !on_tile) {
                         // Strike, Wrestle or Shoot at a place where no creature is: nothing
-                        mouse_log.push_back("click: no creature there");
-                        trace.after();
                         return;
                     }
                 }
                 if (!no_target && !on_tile && unit_id < 0) {
-                    trace.after();
                     return;     // the sky
                 }
                 // (a sheet can be shown at any time)
@@ -6149,13 +6199,10 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
                     pending_click.px = click_px;
                     pending_click.py = click_py;
                     pending_click.until_ms = now_ms() + 2500;
-                    mouse_log.push_back("click: kept until the game takes input");
-                    trace.after();
                     return;
                 }
                 pending_click.on = false;
                 carry_out(click_intent, unit_id, target, click_px, click_py);
-                trace.after();
                 return;
             }
             // Walk: a creature next to you is stepped past onto its tile, not struck
@@ -6166,23 +6213,15 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
                 enabler->mouse_lbut_down = 0;
                 if (game_takes_input(adv) && attack.frames <= 0)
                     step_onto(picked_pos, "In the way");
-                trace.after();
                 return;
             }
             if (view_click && !on_tile) {
                 // the sky: a plain click there would go to whatever the game finds under it
                 enabler->mouse_lbut = 0;
                 enabler->mouse_lbut_down = 0;
-                trace.after();
                 return;
             }
             map_for_click.emplace(this, redirect.get());
-            if (trace.on)
-                trace.note = "redirect " + std::to_string(int(redirect->state)) + " pick " +
-                             std::to_string(redirect->picked.x) + "," + std::to_string(redirect->picked.y) + "," +
-                             std::to_string(redirect->picked.z) + " keys " +
-                             std::to_string(input ? input->size() : 0) + " focus " +
-                             (Gui::getCurFocus(true).empty() ? "" : Gui::getCurFocus(true)[0]);
         }
         if (active && showing && input && !attack.driving && !mouse_buttons_active() && default_adventure_ui() &&
             plain_adventure_focus()) {
@@ -6266,7 +6305,6 @@ struct dungeon_hook : df::viewscreen_dungeonmodest {
             step_not_strike(*input))
             return;
         INTERPOSE_NEXT(feed)(input);
-        trace.after();
     }
 };
 
@@ -6344,7 +6382,6 @@ fpv::Sky sky;
 fpv::Precip precip;
 fpv::Weather sky_shown;
 bool sky_shown_valid = false;
-int sky_shown_pick = -1;
 const auto sky_epoch = std::chrono::steady_clock::now();
 
 // Lightning in a storm (render thread only): a flash every 30 to 90 seconds,
@@ -6397,11 +6434,10 @@ float lightning_step(const fpv::Weather &w, bool outside, double secs) {
     return std::max({pulse(0.0, 0.12, 0.8f), pulse(0.2, 0.08, 0.5f), pulse(0.34, 0.45, 1.0f)});
 }
 
-void follow_weather(const fpv::Weather &want, int pick, float dt) {
-    if (!sky_shown_valid || pick != sky_shown_pick) {
+void follow_weather(const fpv::Weather &want, float dt) {
+    if (!sky_shown_valid) {
         sky_shown = want;
         sky_shown_valid = true;
-        sky_shown_pick = pick;
         return;
     }
     fpv::Weather &w = sky_shown;
@@ -6489,6 +6525,7 @@ void destroy_frame_texture() {
     destroy_ui_textures();
     destroy_inv_textures();
     destroy_jr_textures();
+    destroy_travel_textures();
     destroy_radial_textures();
 }
 
@@ -6820,7 +6857,7 @@ int look_heading = -1;
 // The pointer over the view: none while the mouse turns the camera (the
 // crosshair is there instead), a gauntlet while it is free. Outside the view
 // the system's own pointer comes back.
-enum class Pointer { System, None, Gauntlet };
+enum class Pointer { System, None, Gauntlet, Jump };
 Pointer pointer_shown = Pointer::System;
 SDL_Cursor *cursor_none = nullptr, *cursor_gauntlet = nullptr;
 
@@ -6903,6 +6940,14 @@ void show_pointer(Pointer want) {
         cursor = cursor_none;
     else if (want == Pointer::Gauntlet)
         cursor = cursor_gauntlet;
+    else if (want == Pointer::Jump) {
+        int cell_h = 12;
+        if (enabler && enabler->renderer)
+            cell_h = std::max(1, static_cast<df::renderer_2d_base *>(enabler->renderer)->dispy_z);
+        cursor = jump_cursor(cell_h);
+        if (!cursor)
+            cursor = cursor_gauntlet;
+    }
     if (!cursor) {
         if (pointer_shown == Pointer::System)
             return;   // nothing of ours to take back
@@ -7404,7 +7449,15 @@ void draw_view(df::renderer_2d_base *r) {
         camera.tilt = 0;
         camera.pitch = look_pitch * H;
     }
-    show_pointer(look_on ? Pointer::None : Pointer::Gauntlet);
+    // jumping, the pointer over the view is the jump's picture
+    const bool jumping = jump_shown();
+    {
+        int mx = -1, my = -1;
+        sdl_get_mouse_state(&mx, &my);
+        show_pointer(look_on ? Pointer::None
+                     : jumping && !over_interface(mx, my) ? Pointer::Jump
+                                                          : Pointer::Gauntlet);
+    }
 
     view_out_w = out_w;
     view_out_h = out_h;
@@ -7412,8 +7465,9 @@ void draw_view(df::renderer_2d_base *r) {
     fpv::RenderOptions opt;
     {
         // brighten what the pointer is on (found in the previous frame)
+        // (jumping, the square under it is lit instead)
         int mx, my;
-        if (pointer_pixels(mx, my) && !over_interface(mx, my))
+        if (!jumping && pointer_pixels(mx, my) && !over_interface(mx, my))
             opt.highlight = pick_pixels(mx, my);
     }
     opt.zlo = t.zlo;
@@ -7421,8 +7475,9 @@ void draw_view(df::renderer_2d_base *r) {
     opt.view_distance = settings.view_distance;
     opt.daylight = t.daylight;
     opt.fog = t.fog;
+    opt.sight = settings.visibility_gradient;
     {
-        follow_weather(t.weather, t.weather_pick, dt);
+        follow_weather(t.weather, dt);
         const double secs = std::chrono::duration<double>(now - sky_epoch).count();
         // the waves on water step through their pictures ten times a second
         opt.wave_frame = int(std::fmod(secs * 10.0, double(fpv::WAVE_FRAMES)));
@@ -7470,6 +7525,8 @@ void draw_view(df::renderer_2d_base *r) {
             renderer->render(scene, camera, opt, W, H, frame_buffer.data());
         drew_3d = gpu_frame;
     }
+    // the graphics card renderer makes its frame at the window's size
+    jump_note_camera(camera, gpu_frame ? out_w : W, gpu_frame ? out_h : H);
     // what the last frame painted over the world: x0, y0, x1, y1
     static int painted_before[4] = {0, 0, 0, 0};
     bool send_all = false;
@@ -7585,6 +7642,12 @@ void draw_view(df::renderer_2d_base *r) {
         sdl_set_render_draw_blend_mode(sdl, bm);
         sdl_set_render_draw_color(sdl, cr, cg, cb, ca);
     }
+    if (jumping) {
+        int mx = out_w / 2, my = out_h / 2;
+        if (!look_on && !debug_look)
+            sdl_get_mouse_state(&mx, &my);
+        draw_jump_squares(sdl, out_w, out_h, mx, my);
+    }
     draw_minimap(r, sdl);
     draw_foes(sdl);
     sync_ui_textures(sdl);
@@ -7648,7 +7711,10 @@ struct renderer_hook : df::renderer_2d_base {
             draw_inventory(static_cast<SDL_Renderer *>(sdl_renderer));
             draw_leaf_tabs(static_cast<SDL_Renderer *>(sdl_renderer), inv_place_x, inv_place_y, PT_INVENTORY);
         }
-        if (active && jr_up && sdl_renderer)
+        // the travel map's tracked marks, under the journal panel
+        if (sdl_renderer && travel_live())
+            draw_travel_marks(static_cast<SDL_Renderer *>(sdl_renderer), this);
+        if ((active || travel_live()) && jr_up && sdl_renderer)
             draw_journal(static_cast<SDL_Renderer *>(sdl_renderer));
         // the hint over a hurt body part (the doll, the aiming menu), over everything but the ring
         if (active && sdl_renderer && (showing || doll_only) && !look_on && !radial_open && !radial_config_open)
@@ -7722,7 +7788,7 @@ command_result set_active(color_ostream &out, bool on) {
         realtime = false;
         restore_zoom();
     }
-    is_enabled = active;
+    sync_enabled();
     // make the game repaint the map now that the image is gone or about to appear
     if (gps)
         ++gps->force_full_display_count;
@@ -7743,7 +7809,7 @@ command_result set_setting(color_ostream &out, const string &key, const string &
             key == "minimap_ascii" || key == "wasd" || key == "mouse_look" || key == "combat_menus" || key == "inventory_panel" || key == "journal_panel" || key == "radial_menu" ||
             key == "game_tips" || key == "body_doll" || key == "status_bars" || key == "hardware_renderer" || key == "any_conflict_discs" ||
             key == "compass_markers" || key == "cursor_hint" || key == "enemy_list" || key == "auto_attack" ||
-            key == "far_land") {
+            key == "far_land" || key == "visibility_gradient") {
             if (!parse_bool(value, b))
                 return CR_WRONG_USAGE;
             if (key == "relative_controls") settings.relative_controls = b;
@@ -7766,6 +7832,7 @@ command_result set_setting(color_ostream &out, const string &key, const string &
             else if (key == "compass_markers") settings.compass_markers = b;
             else if (key == "cursor_hint") settings.cursor_hint = b;
             else if (key == "far_land") settings.far_land = b;
+            else if (key == "visibility_gradient") settings.visibility_gradient = b;
             else settings.compass = b;
             return CR_OK;
         }
@@ -7784,7 +7851,6 @@ command_result set_setting(color_ostream &out, const string &key, const string &
     else if (key == "horizon") settings.horizon = std::clamp(f, 500.0f, 60000.0f);
     else if (key == "far_trees") settings.far_trees = std::clamp(f, 0.0f, 1400.0f);
     else if (key == "max_depth") { settings.max_depth = std::clamp(int(f), 0, 999); full_capture = true; }
-    else if (key == "debug_weather") debug_weather = std::clamp(int(f), 0, WEATHER_PICKS - 1);
     else {
         out.printerr("fpview: unknown setting '{}'\n", key);
         return CR_FAILURE;
@@ -7953,14 +8019,6 @@ command_result do_command(color_ostream &out, vector<string> &parameters) {
             out.print("(no hover text)\n");
         return CR_OK;
     }
-    if (cmd == "mouselog") {
-        // testing aid: what recent clicks did
-        for (const std::string &line : mouse_log)
-            out.print("{}\n", line);
-        out.print("{} entries\n", mouse_log.size());
-        mouse_log.clear();
-        return CR_OK;
-    }
     if (cmd == "debug" && parameters.size() == 3) {
         if (parameters[1] == "noblank")
             debug_noblank = parameters[2] == "on";
@@ -8030,15 +8088,13 @@ command_result do_command(color_ostream &out, vector<string> &parameters) {
         out.print("  graphics card renderer: off\n");
     {
         fpv::Weather w;
-        int pick = 0;
         {
             std::lock_guard<std::mutex> lock(target_mutex);
             w = target.weather;
-            pick = target.weather_pick;
         }
-        out.print("  weather: {}; {:.1f} h, day {}, moon {:.2f}; cirrus {:.1f} cumulus {:.1f}/{:.1f} nimbus {:.1f} "
+        out.print("  weather: {:.1f} h, day {}, moon {:.2f}; cirrus {:.1f} cumulus {:.1f}/{:.1f} nimbus {:.1f} "
                   "altostratus {:.1f} stratus {:.1f} fog {:.2f} rain {:.1f} snow {:.1f} evil {:.1f}\n",
-                  WEATHER_NAMES[std::clamp(pick, 0, WEATHER_PICKS - 1)], w.hour, w.day, w.moon,
+                  w.hour, w.day, w.moon,
                   w.cloud[fpv::CLOUD_CIRRUS], w.cloud[fpv::CLOUD_CUMULUS], w.cloud[fpv::CLOUD_CUMULUS_MANY],
                   w.cloud[fpv::CLOUD_NIMBUS], w.cloud[fpv::CLOUD_ALTOSTRATUS], w.cloud[fpv::CLOUD_STRATUS], w.fog,
                   w.rain, w.snow, w.evil);
@@ -8106,11 +8162,18 @@ DFhackCExport command_result plugin_onupdate(color_ostream &out) {
     const bool controlled = (World::isAdventureMode() || arena) && adv && !Units::isDead(adv) && Maps::IsValid();
     if (!active) {
         gone = 0;
+        // travelling (the view off until it ends): the game's journal opened from
+        // the travel map is still replaced by the panel
+        if (adventure && adventure->menu == df::ui_advmode_menu::Travel && (resume_unit >= 0 || resume_hf >= 0)) {
+            journal_takeover();
+            journal_step();
+        }
         if (resume_unit < 0 && resume_hf < 0) {
             back = 0;
         } else if (df::unit *u = resume_unit >= 0 ? df::unit::find(resume_unit) : nullptr; u && Units::isDead(u)) {
             resume_unit = -1;
             resume_hf = -1;
+            sync_enabled();
         } else if (controlled && (adv->id == resume_unit || (resume_hf >= 0 && adv->hist_figure_id == resume_hf)) &&
                    default_adventure_ui()) {
             // wait until the game has settled on its plain screen again
@@ -8157,7 +8220,7 @@ DFhackCExport command_result plugin_onstatechange(color_ostream &out, state_chan
                 resume_hf = last_view_hf;
             }
             active = false;
-            is_enabled = false;
+            sync_enabled();
         }
         showing = false;
         realtime = false;
@@ -8166,6 +8229,9 @@ DFhackCExport command_result plugin_onstatechange(color_ostream &out, state_chan
         published_state = -1;
         publish_state(false, false);
         farland.clear(scene);
+        // item ids and the game's texture numbers mean other things in the next world
+        inv_forget_pictures();
+        inv_pictures_unit = -1;
         std::lock_guard<std::mutex> lock(scene.mutex);
         scene.reset();
         full_capture = true;

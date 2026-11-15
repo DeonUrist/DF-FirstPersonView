@@ -633,12 +633,6 @@ function NumberField:render(dc)
     NumberField.super.render(self, dc)
 end
 
--- Weather to test with, in the plugin's order (WEATHER_NAMES in fpview.cpp).
--- The first is the game's own. Not stored: every game starts with the real weather.
-local WEATHER_NAMES = {'None (real weather)', 'Clear', 'Cumulus', 'Many cumulus', 'Cirrus', 'Altostratus',
-    'Overcast', 'Mist', 'Fog', 'Thick fog', 'Rain', 'Storm', 'Snow', 'Blood rain', 'Evil cloud'}
-weather_pick = weather_pick or 1
-
 function SettingsScreen:init()
     local function toggle(key, row, hotkey, label)
         return widgets.ToggleHotkeyLabel{
@@ -670,7 +664,7 @@ function SettingsScreen:init()
     markers.enabled = function() return config.get('compass') end
     self:addviews{
         widgets.Window{
-            frame={w=56, h=25},
+            frame={w=56, h=22},
             frame_title='First Person View settings',
             subviews={
                 toggle('hardware_renderer', 0, 'CUSTOM_H', 'Hardware renderer'),
@@ -681,6 +675,7 @@ function SettingsScreen:init()
                 toggle('enemy_list', 5, 'CUSTOM_E', 'Enemy list'),
                 toggle('auto_attack', 6, 'CUSTOM_A', 'Auto attack'),
                 toggle('far_land', 7, 'CUSTOM_L', 'Far land'),
+                toggle('visibility_gradient', 8, 'CUSTOM_V', 'Visibility gradient'),
                 number('view_distance', 9, 'CUSTOM_D', 'Draw distance, tiles'),
                 number('max_height', 10, 'CUSTOM_U', 'Maximum height, levels'),
                 number('max_depth', 11, 'CUSTOM_N', 'Maximum depth, levels'),
@@ -703,19 +698,6 @@ function SettingsScreen:init()
                     end,
                     on_change=function(idx)
                         set_from_screen('fov', FOV_MIN + (idx - 1) * FOV_STEP)
-                    end,
-                },
-                widgets.Label{
-                    frame={t=19, l=0},
-                    text={'Weather (debug): ', {text=function() return WEATHER_NAMES[weather_pick] end, pen=COLOR_YELLOW}},
-                },
-                widgets.Slider{
-                    frame={t=20, l=0, w=3 * (#WEATHER_NAMES - 1) + 7},
-                    num_stops=#WEATHER_NAMES,
-                    get_idx_fn=function() return weather_pick end,
-                    on_change=function(idx)
-                        weather_pick = idx
-                        dfhack.run_command_silent(config.PLUGIN, 'set', 'debug_weather', tostring(idx - 1))
                     end,
                 },
             },
@@ -844,6 +826,97 @@ dfhack.onStateChange[GLOBAL_KEY] = function(sc)
             plugin('on')
         end
     end
+end
+
+---------------------------------------------------------------------------
+-- installing the plugin
+--
+-- DFHack loads plugins only from <DF>/hack/plugins, never from a mod. The mod
+-- (from the Steam Workshop) carries the plugin in its dfhack_plugin folder and
+-- copies it there: on the first start, and again when an update of the mod
+-- brings a different file. Only at the title screen: loading or unloading the
+-- plugin while a world is loaded freezes the game.
+
+local PLUGIN_FILE = 'fpview.plug.dll'
+
+local function read_file(path)
+    local f = io.open(path, 'rb')
+    if not f then return nil end
+    local data = f:read('a')
+    f:close()
+    return data
+end
+
+local function at_title()
+    if dfhack.isWorldLoaded() then return false end
+    local screen = dfhack.gui.getDFViewscreen(true)
+    return screen ~= nil and df.viewscreen_titlest:is_instance(screen)
+end
+
+local function install_problem(text)
+    dfhack.printerr('First Person View: ' .. text:gsub('\n', ' '))
+    require('gui.dialogs').showMessage('First Person View', text, COLOR_LIGHTRED)
+end
+
+-- true when done (or nothing to do), false to be tried again later
+local function install_plugin()
+    local dir = mod_dir()
+    if not dir or dfhack.getOSType() ~= 'windows' then return true end
+    local shipped = dir .. '/dfhack_plugin/'
+    if not dfhack.filesystem.isfile(shipped .. PLUGIN_FILE) then return true end
+    if not at_title() then return false end
+    local data = read_file(shipped .. PLUGIN_FILE)
+    local dest = dfhack.getHackPath() .. '/plugins/' .. PLUGIN_FILE
+    if not data or read_file(dest) == data then return true end
+
+    local built_for = (read_file(shipped .. 'dfhack_version.txt') or ''):match('^%s*(.-)%s*$')
+    local running = dfhack.getDFHackVersion()
+    if built_for ~= '' and built_for ~= running then
+        install_problem(('This version of First Person View is made for DFHack %s,\n'
+            .. 'but DFHack %s is installed. The first-person view stays off\n'
+            .. 'until the mod is updated for this DFHack.'):format(built_for, running))
+        return true
+    end
+
+    local was_loaded = plugin_available()
+    if was_loaded then dfhack.run_command_silent('unload', PLUGIN) end
+    local f = io.open(dest, 'wb')
+    local written = f and f:write(data) and true
+    if f then f:close() end
+    dfhack.run_command_silent('load', PLUGIN)
+    if not written then
+        install_problem(("Could not copy the mod's plugin into\n%s\n"
+            .. "Copy %s there from the mod's dfhack_plugin folder by hand\n"
+            .. "and restart the game."):format(dest, PLUGIN_FILE))
+    elseif not plugin_available() then
+        install_problem("The mod's plugin was copied into hack/plugins but DFHack\n"
+            .. "could not load it. The DFHack console says why.")
+    else
+        push_settings()
+        print(('First Person View: %s its plugin in hack/plugins.'):format(was_loaded and 'updated' or 'installed'))
+    end
+    return true
+end
+
+-- once per game session, from DFHack's update rather than while the overlay
+-- loads this script
+local function try_install()
+    if plugin_install_done then return end
+    local ok, done = pcall(install_plugin)
+    if not ok then
+        dfhack.printerr('First Person View: installing the plugin failed: ' .. tostring(done))
+        done = true
+    end
+    if done then
+        plugin_install_done = true
+    else
+        dfhack.timeout(100, 'frames', try_install)
+    end
+end
+
+if not plugin_install_scheduled then
+    plugin_install_scheduled = true
+    dfhack.timeout(1, 'frames', try_install)
 end
 
 apply_hotkey()

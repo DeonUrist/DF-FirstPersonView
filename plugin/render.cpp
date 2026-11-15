@@ -137,13 +137,16 @@ inline uint32_t lerp_color(int r0, int g0, int b0, int r1, int g1, int b1, float
     return rgb(int(r0 + (r1 - r0) * t + 0.5f), int(g0 + (g1 - g0) * t + 0.5f), int(b0 + (b1 - b0) * t + 0.5f));
 }
 
-// blends towards the fog colour: f = 256 keeps the colour, 0 is pure fog
+// blends towards the fog colour: f = 256 keeps the colour, 0 is pure fog; and
+// then darkens by the light on it: keep = 256 none, 0 black
 struct Shade {
     uint32_t f, fog_rb, fog_g;
-    Shade(uint32_t fog, int f256) {
-        f = uint32_t(std::clamp(f256, 0, 256));
-        fog_rb = (fog & 0x00FF00FFu) * (256 - f);
-        fog_g = (fog & 0x0000FF00u) * (256 - f);
+    Shade(uint32_t fog, int f256, int keep = 256) {
+        const uint32_t ff = uint32_t(std::clamp(f256, 0, 256));
+        const uint32_t k = uint32_t(std::clamp(keep, 0, 256));
+        f = (ff * k) >> 8;
+        fog_rb = (fog & 0x00FF00FFu) * (((256 - ff) * k) >> 8);
+        fog_g = (fog & 0x0000FF00u) * (((256 - ff) * k) >> 8);
     }
     inline uint32_t operator()(uint32_t c) const {
         const uint32_t rb = (((c & 0x00FF00FFu) * f + fog_rb) >> 8) & 0x00FF00FFu;
@@ -151,6 +154,13 @@ struct Shade {
         return 0xFF000000u | rb | g;
     }
 };
+
+// a colour darkened: k = 256 keeps it, 0 is black
+inline uint32_t darken(uint32_t c, uint32_t k) {
+    const uint32_t rb = (((c & 0x00FF00FFu) * k) >> 8) & 0x00FF00FFu;
+    const uint32_t g = (((c & 0x0000FF00u) * k) >> 8) & 0x0000FF00u;
+    return (c & 0xFF000000u) | rb | g;
+}
 
 // lift a colour towards white, to mark what the pointer is on
 inline uint32_t brighten(uint32_t c) {
@@ -186,6 +196,7 @@ struct Renderer::Frame {
     uint16_t roof;
     Pick hl;
     int wave = 0;                     // step of the waves' animation
+    const SightMap *sight = nullptr;  // light by what the adventurer sees, or none
     std::vector<const Billboard *> bills;   // far to near
     std::vector<float> bill_depth, bill_lat;
 };
@@ -240,6 +251,7 @@ void Renderer::render(const Scene &scene, const Camera &cam, const RenderOptions
     f.nboxsets = int(scene.boxsets.size());
     f.hl = opt.highlight;
     f.wave = opt.wave_frame;
+    f.sight = opt.sight && scene.sight.on ? &scene.sight : nullptr;
     f.sky = opt.sky && opt.sky->ready() ? opt.sky : nullptr;
 
     // is the camera itself under the open sky?
@@ -345,9 +357,10 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
         Span *spans = &spans_[size_t(sx) * MAX_SPANS];
         int nspans = 0;
         int nmasked = 0;
-        const auto record = [&](int a, int b, float depth, int tx, int ty, int tz) {
+        const auto record = [&](int a, int b, float depth, int tx, int ty, int tz, float da = -1, float db = -1) {
             if (nspans < MAX_SPANS)
-                spans[nspans++] = Span{int16_t(a), int16_t(b), depth, int16_t(tx), int16_t(ty), int16_t(tz)};
+                spans[nspans++] = Span{int16_t(a), int16_t(b), depth, int16_t(tx), int16_t(ty), int16_t(tz),
+                                       da < 0 ? depth : da, db < 0 ? depth : db};
         };
         // water over the open rows of this column (see veil_)
         uint32_t *veil = veil_.data() + size_t(sx) * H;
@@ -441,7 +454,8 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
                         masked_[size_t(sx) * MAX_MASKED + nmasked++] =
                             Masked{d0, hz - (h0 + LEVEL_H) * inv0, hz - h0 * inv0, cells[ci].frame,
                                    uint8_t(face_texx()), int16_t(mapx), int16_t(mapy), int16_t(f.zlo + k),
-                                   int16_t(shade_factor(d0) * dark)};
+                                   int16_t(shade_factor(d0) * dark),
+                                   int16_t(f.sight ? 256 * f.sight->at(f.px + d0 * rx, f.py + d0 * ry, (f.zlo + k + 0.5f) * LEVEL_H) : 256)};
                     }
                     for (int k = k_lo; k <= k_hi && open.n > 0; ++k) {
                         const Cell *cells = f.cells[k];
@@ -608,7 +622,7 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
                         if (tile_lit && tz == f.hl.z)
                             for (int y = s; y < e; ++y)
                                 col[y] = brighten(col[y]);
-                        record(s, e, d1, mapx, mapy, tz);
+                        record(s, e, d1, mapx, mapy, tz, dh * row_inv_[s], dh * row_inv_[e - 1]);
                     }
                 };
 
@@ -683,7 +697,11 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
                         if (tile_lit && tz == f.hl.z)
                             for (int y = s; y < e; ++y)
                                 col[y] = brighten(col[y]);
-                        record(s, e, db, mapx, mapy, tz);
+                        const auto row_d = [&](int y) {
+                            const float den = (y + 0.5f - hz) / S + m;
+                            return den > 1e-5f ? std::clamp(n / den, da, db) : db;
+                        };
+                        record(s, e, db, mapx, mapy, tz, row_d(s), row_d(e - 1));
                     }
                 };
                 // A slope, as straight pieces from near to far. A valley (a slope
@@ -1182,6 +1200,38 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
             const uint32_t g = (((c & 0x0000FF00u) * ia + (w & 0x0000FF00u) * a) >> 8) & 0x0000FF00u;
             col[y] = 0xFF000000u | rb | g;
         }
+
+        // The light: what the adventurer cannot see is dark. Each span lies in
+        // one tile, so the light at its two ends, spread across its rows, is enough.
+        if (f.sight) {
+            const SightMap &sm = *f.sight;
+            const float *depth_col = far_depth_.data() + size_t(sx) * H;
+            const auto light_at = [&](int y, float d) {
+                const float z = f.eye + (hz - (y + 0.5f)) * d / S;
+                return sm.at(f.px + d * rx, f.py + d * ry, z);
+            };
+            for (int si = 0; si < nspans; ++si) {
+                const Span &s = spans[si];
+                if (s.tz == -1 || s.b <= s.a)
+                    continue;   // the sky
+                if (s.tz == -2) {
+                    for (int y = s.a; y < s.b; ++y) {
+                        const float d = depth_col[y];
+                        const float k = sm.column(f.px + d * rx, f.py + d * ry);
+                        if (k < 0.996f)
+                            col[y] = darken(col[y], uint32_t(k * 256.0f));
+                    }
+                    continue;
+                }
+                const float k0 = light_at(s.a, s.da), k1 = light_at(s.b - 1, s.db);
+                if (k0 >= 0.996f && k1 >= 0.996f)
+                    continue;
+                const float step = s.b - s.a > 1 ? (k1 - k0) / float(s.b - 1 - s.a) : 0.0f;
+                float k = k0;
+                for (int y = s.a; y < s.b; ++y, k += step)
+                    col[y] = darken(col[y], uint32_t(std::clamp(k, 0.0f, 1.0f) * 256.0f));
+            }
+        }
         span_count_[sx] = uint8_t(nspans);
         hit_count_[sx] = 0;
         masked_count_[sx] = uint8_t(nmasked);
@@ -1227,7 +1277,7 @@ void Renderer::draw_ring(const Frame &f, const Billboard &b, float bill_depth, i
     const int cy1 = std::clamp(int(f.hz + drop * f.S / d_lo) + 2, 0, H);
     if (cx0 >= cx1 || cy0 >= cy1)
         return;
-    const uint32_t col_ring = b.ring;
+    const uint32_t col_ring = f.sight ? darken(b.ring, uint32_t(256 * f.sight->at(b.x, b.y, b.base + 0.4f))) : b.ring;
     const auto mix = [](uint32_t under, uint32_t over, int a) {
         const int r = (px_r(under) * (256 - a) + px_r(over) * a) >> 8;
         const int g = (px_g(under) * (256 - a) + px_g(over) * a) >> 8;
@@ -1289,7 +1339,7 @@ void Renderer::renderBillboards(const Frame &f, int x0, int x1) {
                 break;
             --next;
             const Tex &tex = f.scene->tex.get(m.tex);
-            const Shade shade(f.fog, m.shade);
+            const Shade shade(f.fog, m.shade, m.keep);
             const float scale = 32.0f / std::max(m.bot - m.top, 1e-3f);
             const bool lit = f.hl.unit_id < 0 && f.hl.x == m.tx && f.hl.y == m.ty && f.hl.z == m.tz;
             const Span *spans = &spans_[size_t(sx) * MAX_SPANS];
@@ -1343,7 +1393,8 @@ void Renderer::renderBillboards(const Frame &f, int x0, int x1) {
         if (cx0 >= cx1 || cy0 >= cy1)
             continue;
 
-        const Shade shade(f.fog, int(256 * (1 - haze_at(depth * inv_view, f.view_dist, f.weather_haze, f.weather_reach))));
+        const int keep = f.sight ? int(256 * f.sight->at(b.x, b.y, b.base + 0.4f)) : 256;
+        const Shade shade(f.fog, int(256 * (1 - haze_at(depth * inv_view, f.view_dist, f.weather_haze, f.weather_reach))), keep);
         const float inv_pps = 1.0f / pps;
         const int ystep = int(inv_pps * 65536.0f);
         const bool lit = f.hl.valid() &&

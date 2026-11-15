@@ -60,7 +60,11 @@ exactly the installed DFHack version.
 - Game: `C:\Soft\Steam\steamapps\common\Dwarf Fortress`
 - Installed mod (what the game reads): `%APPDATA%\Bay 12 Games\Dwarf Fortress\mods\first_person_view`
   (scripts and `media`). DFHack only scans that mods folder.
-- Installed plugin: `<game>\hack\plugins\fpview.plug.dll`
+- Installed plugin: `<game>\hack\plugins\fpview.plug.dll`. The installed mod also carries a copy in
+  `dfhack_plugin\` with `dfhack_version.txt` (written by `install.ps1`): that is how the Steam Workshop
+  delivers it. `first-person.lua` (`install_plugin`) copies it into `hack\plugins` at the title screen,
+  once per game session, when the two files differ, unloading the old plugin first. Built 2026-11-16,
+  not run in the game.
 - Saves: `%APPDATA%\Bay 12 Games\Dwarf Fortress\save`
 - Toolchain (git-ignored): `_refs\dfhack` (DFHack source at the matching tag), `_refs\tools`
   (portable Perl, pip CMake). See the header of `plugin\build.ps1`.
@@ -148,8 +152,7 @@ a few lines each):
   pointer in window pixels), `fpview find` (aim it at a creature in view), `fpview pick`,
   `fpview face N|NE|...`, `fpview camera <x> <y> <z>|off`, `fpview debug look|noblank|center
   on|off`, `fpview intent [next|info|interact|walk|strike|shoot|throw|wrestle|unnock]`, `fpview menu` (contents and pixel
-  positions of the paperdoll/attack menu), `fpview hint`, `fpview mouselog` (what recent clicks and
-  the attack driver did), `fpview tilt <degrees>|off` and `fpview yaw <degrees>|off` (look up
+  positions of the paperdoll/attack menu), `fpview hint`, `fpview tilt <degrees>|off` and `fpview yaw <degrees>|off` (look up
   or down and in any direction, as the mouse would). Always end with `fpview pointer off`.
   `fpview status` shows which renderer drew the last frame, its triangle count and where frame time
   went since the last `status` (average and worst: the whole capture, the game's own draws in it, map
@@ -233,6 +236,8 @@ Files:
   painting, the render thread's drawing, the file-level state); `inventory_hook.inc` is included inside
   `dungeon_hook` and holds only functions (input, the clicks on the game's list). Item pictures come from
   `fpv::itemPicture` in `scene.cpp`.
+- `jump.inc`: the jump squares, picking on your level and the jump pointer (see "Jumping" under
+  "Mechanisms").
 - `menu.inc`: included inside `fpview.cpp`'s anonymous namespace. Intents, media/textures for the
   UI, the paperdoll and attack menus (model, layout shared by drawing and clicking, painting,
   reading the game's dialog), the player's own paperdoll, the compass.
@@ -245,6 +250,33 @@ not call into the plugin (a suspected deadlock during plugin load).
 
 ## Mechanisms worth knowing before touching them
 
+- **The game captions whatever of its own lies under the pointer on its own layout, hidden or not**
+  (2026-11-15, built only). Over the view the game is shown the pointer at `game_pointer_spot` (the
+  middle of the screen, or a point halfway to a side if a window of the game's is there), with the
+  window moved to put the looked-at tile under it, in `logic` (`PointerRedirect(..., hover)`) and in the
+  tip draw in `capture`; shown it where it really was, it captioned the hidden nearby places in the top
+  left. Over our panels (doll, bars, message list) the game gets no pointer unless one of its own cells
+  is left there after capture (`note_game_cells`, `game_shows_at`); before, it captioned the buttons
+  the ring replaces. Clicks still reach the game at the real pointer.
+- **The game's top layer (`screen_top`) holds windows drawn over the rest.** Code that checks the lower
+  layer must not empty both: `take_cell` / `blank_cell` do. The "drawn as on the plain screen" step of
+  `remove_bottom_buttons` cut the bottom of the ability and craft/butcher windows that way, and
+  `hide_nearby_again` cut the corner of the Esc settings; both now empty only lower-layer cells equal
+  to what they took off the plain screen. That those windows are in the top layer is the best reading
+  of the code, not checked in the game.
+- **Jumping** (`jump.inc`, 2026-11-16, built only, not seen in the game). The game's jump
+  (`main_interface.adventure.jump.open`, focus `dungeonmode/Jump`, so mouse look is off) takes a tile on
+  your own level, also one in the air. `jump_update` (capture) lists the tiles the game allows, by its
+  rules read from the code of 53.17 (the comment at the top of `jump.inc`: up to 5 tiles away, a standing
+  jump exactly 2 tiles, a running one 3..5 ahead by speed from `unit.job.move_momentum_dir` and
+  `gait_buildup`, offsets checked by a `static_assert`). Guesses: the game's tile test is taken as "not
+  hidden", the speed is the gait's own without the game's modifiers, walls are left out. `jump_pick` crosses
+  the pointer's ray with your level's floor height (the camera of the frame on screen, `jump_note_camera`);
+  `PointerRedirect` uses it instead of `pick_pixels` while jumping, and `MapForClick` puts the game's jump
+  cursor on the tile. `draw_jump_squares` draws the squares with `SDL_RenderGeometry` under the interface;
+  the pointer is `Pointer::Jump`, the ring's jump picture (`jump_cursor`, about three cells tall). Whether
+  a click on a map tile jumps at once in the game's jump mode (rather than only moving its cursor) was
+  not checked.
 - **The game decides what a click or hover hit from its top-down map.** We keep that map blank, so
   for a click the window is shifted to put the picked tile under the pointer and the map is drawn
   for that moment (`PointerRedirect`, `MapForClick`). The hover box is computed in `logic`, so the
@@ -257,7 +289,10 @@ not call into the plugin (a suspected deadlock during plugin load).
   with its cells blanked; our panel is drawn in pixels. The dialog's rows are read off the interface
   grid (hotkey letter in green, name, two rated descriptions, marks), scrolling the game's list to
   see every row. A click on our menu scrolls the game's list to that row and clicks it there. This
-  depends on English text layout, not on game structures.
+  depends on English text layout, not on game structures. A left click inside the menu's panel
+  (`on_menu_panel`) goes to `menu_input` before the message panel and the doll and bars squares: the
+  panel reaches down over them, and the aimed-strike doll's feet were lost to the message panel
+  (2026-11-15, built only).
 - **The inventory panel** (`inventory.inc`, `inventory_hook.inc`, setting `inventory_panel`), 2026-11-14:
   with the game's inventory open (`main_interface.adventure.inventory.open`; `adventure->menu` stays
   `Default`, so the view keeps showing behind it) and no DFHack window or item sheet over it. Read from
@@ -281,14 +316,27 @@ not call into the plugin (a suspected deadlock during plugin load).
   the ones the game draws in its own list (`read_game_icons`: a texture anchored over 5 x 3 cells per
   row, flag 0 at its top left, the name on the row below its top after the key letter; these are
   textures the game makes per kind of item, readable with `readSprite`), the unseen list paged a frame
-  at a time until every item was seen; `fpv::itemPicture` is the fallback. Of `unit.texpos[3][2]` some
+  at a time until every item was seen; `fpv::itemPicture` is the fallback. Their pixels are copied in
+  `inventory_grid_capture`, right after the game's draw (`inv_grid.pictures`), and kept per item with its
+  listed name (`GameIcon`), never a texture number for later: keeping numbers (item id -> number, number ->
+  picture, never cleared, read a frame late) showed the thirst status icon (UNIT_STATUS) on random items
+  (2026-11-15), since the game hands freed numbers out again. Cleared on world unload and when the adventurer
+  changes (`inv_forget_pictures`). A read is only a candidate (`note_game_icon`): it becomes the item's
+  picture once the same number has shown the same pixels for `ICON_STEADY_MS` (250 ms; no picture at all
+  only after `ICON_WAIT_MS`), and paging keeps a page up until its pictures have settled. The game makes
+  these pictures on its main thread, and a page shown for one frame was read while the number still held
+  its old picture (the thirst icon on the water in a waterskin after loading a save, 2026-11-15); that this
+  is the mechanism is the best reading, not proven. Until settled the panel shows `fpv::itemPicture`. Built only. Of `unit.texpos[3][2]` some
   are empty (measured: [0][1] and [1][0] fully see-through, [1][1] the sprite): the one with most drawn
   pixels is taken, drawn on the panel's own background. The game's inventory window is taken off the
   grid right after the game's last draw (`inventory_grid_capture`, called from `capture`): its block is
   found from the "Done" text by following the cells with a lower-layer picture; what the game drew is
   copied first (`inv_grid`) and the panel reads rows, pictures and the burden from the copy. With the
   window gone the bottom is laid out as on the plain screen (`bottom_is_plain(...) || inv_window_erased`),
-  which before left the game's long bottom bar showing under the panel. Ground row: items with
+  which before left the game's long bottom bar showing under the panel. A grasping part gets two
+  squares (`InvSlot::held`, `held_of` in `inv_slots`): worn, and under it held (an item whose
+  `invitem->mode` is `Weapon` (the game's GRASP) or `Hauled`); a drop on the held one takes the item
+  into the hand, on the worn one wears it (2026-11-15, built only). Ground row: items with
   `on_ground` on your own tile (what the game's `g` list offers); Pick up goes through that list:
   inventory closed, `A_GROUND`, the row of the `adventure_environment_pick_up_ground_itemst` whose
   `getPickupItem()` is the item clicked (read off the game, 2026-11-14: one "Get ..." row per item on your
@@ -484,6 +532,26 @@ not call into the plugin (a suspected deadlock during plugin load).
   `add_tracked_marks` (called from `tidy_top` in `menu.inc`) puts them first on the compass, recomputed every
   30 frames; `CompassMark`/`MarkSpot` carry the entry (`jkind`, `jid`, `jsub`, the `JK_*` enum now lives in
   `menu.inc`), and a click on such a label opens the panel there directly (`mark_entry_at`).
+- **The travel map** (`travelmap.inc`, 2026-11-15, built only, not seen in the game). While travelling
+  the adventurer's unit is gone (`World::getAdventurer()` null: the local map is put away), so
+  `plugin_onupdate` turns the view off (`active` false) and remembers `resume_hf`; `travel_map_ours()` is
+  the travel map (`adventure.menu == Travel`, focus `dungeonmode/Travel` only) while the view is on or
+  waiting to come back. Its place then: `travel_smm` (the player army's `pos`, in steps of 16 tiles, or
+  `travel_origin_x/y` while `travel_not_moved`); `adv_tile` falls back to it and `adv_figure` to the
+  nemesis record `adventure.player_id`, so the journal works there. Layout read in the game (1920 x 1080,
+  owner on the travel map): `gps->main_map_port` 120 x 68 squares of 16 px from the renderer's origin
+  (0, 4), the army on (`screen_x`, `screen_y`), the port's middle; a square is one embark square (48 tiles,
+  checked against three sites) or, when the game zooms in at a site by itself (`site_level_zoom` 1), 16
+  tiles (seen on the screen: the coast three times larger). The square's pixel size is taken as window /
+  port size rounded up; other window sizes were not seen. `travel_frame` (game thread, after the game's
+  draw in both branches of the render hook) turns the tracked entries into squares; `draw_travel_marks`
+  (render thread, after `update_all`, under the journal panel) draws a "!" with its foot on the square's
+  top edge and the name label under the square, or, outside the room (2 rows under the top, 4 above the
+  bottom), at the room's edge on the line from you, with an arrow and the distance. The journal panel
+  works there: the render hook's inactive branch keeps it (`journal_frame`, `journal_input`,
+  `journal_key` in a travel branch of `feed`, which also takes `A_TRAVEL_LOG` and a click with
+  `current_hover == ADVENTURE_TRAVEL_LOG`); `journal_takeover` also runs while travelling. The Inventory
+  tab does nothing there (no inventory while travelling).
 - **Intents** (`menu.inc`, R in `feed`): a left click in the view does what the intent says. Info sets
   `game->main_interface.view_sheets` (UNIT, BUILDING or ITEM: the game's own sheets, which adventure
   mode shows over the view). Interact on a creature: `A_TALK` opens "Click a creature to start a new
@@ -515,7 +583,16 @@ not call into the plugin (a suspected deadlock during plugin load).
   `plain_adventure_focus()`.
 - **Paperdolls are data.** `media/dolls/NAME.png` + `NAME.txt` (`part name | alt = x, y`). The doll
   with the best score for the creature's part names wins; `humanoid` is for bodies without a neck,
-  `humanoid_neck` for those with one. Do not merge them.
+  `humanoid_neck` for those with one. Do not merge them. The aiming menu scores the target's whole body
+  plan (`body.body_plan->body_parts`, lost parts too), not the game's list: the game leaves severed parts
+  out of it, and a doll picked from the list switched mid-fight (a molemarian, `HAND_FOOT_CENTAUR_NECK`,
+  went from `quadruped_neck` to `humanoid_legless` after losing two legs, 2026-11-15). The game's rows are
+  put on the doll by name; a lost part with a place on the doll gets an entry of its own after the
+  game's rows (an entry's index is its row in the game's list) with `gone` set. Built only.
+- **DFHack calls `plugin_onupdate` only while `is_enabled` is true** (`Plugin::on_update`). The view
+  coming back after sleep or travel (`resume_unit`, `resume_hf`) is decided there, and `set_active(false)`
+  used to set `is_enabled` false, so it never came back (found 2026-11-16, built only). `sync_enabled()`
+  keeps it true while a resume is pending; use it wherever `active` or the resume ids change.
 - **Never call `dfhack.textures.deleteHandle` on batches of textures**: it crashed the game.
 - **A texture number does not name a picture for good.** The game hands freed texture numbers out again
   (seen 2026-11-15: after a second world load in one run the pages' numbers ran downwards through old
@@ -566,6 +643,24 @@ not call into the plugin (a suspected deadlock during plugin load).
   from the game's pictures; these are fixed). `FARLAND_OFFLINE` compiles only the builder, for a test
   program without the game; the test (in a session scratch folder) also ran both renderers, the GPU one
   through stand-in SDL functions that fill the triangles into a picture.
+- **Visibility gradient** (`sight.h/.cpp`, `Scene::sight`, setting `visibility_gradient`), 2026-11-15, built
+  only, never run. Read from the game's map on the game thread (`readSight`, after `farland.update`, again
+  when the tick, your tile, the drawn levels or the map's region change, and every 30 frames): in adventure
+  mode the first of a tile's `designation.dig` bits is its line of sight (df-structures' comment, not checked
+  in the game) and `outside` is open to the sky. Seen tiles get 1 (0.8 under a roof), times a fade from
+  unseen ground (a floor, slope, stair or water not in sight) over `SIGHT_FADE` (5) tiles, measured through
+  seen open tiles only (bucketed distance, 2 across, 3 diagonally), so the rock behind a wall does not darken
+  the room; unseen rock and air say nothing; a seen wall is as light as the open ground it faces. Tiles
+  with `outside` are lifted towards 1 by `daylight_now()` (passed as `day`; owner's request 2026-11-16:
+  outdoors only while the sun is down), unseen outdoor ground to `day` itself. Sampled
+  bilinearly between tile middles (`SightMap::at`, taking the brighter of the two levels a floor or ceiling
+  touches; nothing known there: the column's light); beyond the part read (and the far land) the edge's
+  (`column`). Software renderer: `Span::da/db` (distance at a span's first and last row), the light at both
+  ends spread over the rows after the water veil; the far land per pixel from `far_depth_`; billboards, door
+  frames (`Masked::keep`) and discs through `Shade(fog, f, keep)`. GPU: vertex colour of the textured pass
+  (`light()` turns camera space back into the world), the haze pass's colour dimmed alike, far faces and
+  decals dimmed. The sky is never darkened. Whether the game's line of sight covers the whole map by day
+  (else the far land goes dark outdoors too) was not checked.
 - **The game moves its loaded part of the world** in steps of 48 tiles (`world.map.region_x/y` count
   them) when the adventurer walks far: every local coordinate then means another place. The scene
   is moved along (`Scene::shift`: level grids, column ranges, billboards, creature tiles, glides),
@@ -778,9 +873,8 @@ input):
   (as `Maps::getCurrentWeather` indexes it), and `region_weather`: `FallingMaterial` on the tile's world
   tile is taken as a rain of that material, other kinds within 48 tiles of `world_in_game_x/y` as an
   evil cloud nearby. Guesses: what the moon numbers mean, that evil rain falls whenever its entry
-  exists, the wind bits' direction, the sun's height by season. The weather slider is `fpview set
-  debug_weather N` (the names are in `WEATHER_NAMES` and in the Lua screen; keep the two in the same
-  order). Neither the sky nor the drops have been seen in the game.
+  exists, the wind bits' direction, the sun's height by season. The weather picker for testing
+  (`debug_weather`) was removed for the release (2026-11-16). Neither the sky nor the drops have been seen in the game.
 
 - Lightning, thunder and evil clouds (2026-11-15), built only, not seen or heard in the game. A storm is
   `is_storm`: rain > 0.3 under nimbus >= 0.75 (plain rain gives nimbus 0.6 in `read_weather`, the game's
@@ -992,8 +1086,8 @@ Known guesses and loose ends:
 - Furniture detection assumes site furniture is a building of the listed types; proportions are
   estimates; beds face north and slabs face north/south regardless of the room.
 - The portrait's place is taken as the bottom-left 12 x 8 interface cells.
-- Click diagnostics (`MouseTrace`, `mouselog`, `debug` switches) and a no-op
-  `swallow_rest_of_click` are still in the build.
+- The click log (`MouseTrace`, `mouselog`) was removed for the release (2026-11-16); the console test
+  aids (`pointer`, `find`, `pick`, `debug` switches, `hitches` ...) stay, players never see them.
 - Sliding the map during `logic` (for the game's tip) is new; `game_tips false` turns it off if it
   has side effects.
 - Throwing at a creature may only be offered as throwing at its tile.

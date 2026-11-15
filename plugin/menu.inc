@@ -1465,6 +1465,7 @@ struct CompassMark {
     uint8_t glyph = 0;          // the game's symbol for it; 0 for none
     int jkind = JK_NONE;        // a journal entry tracked on the compass
     int32_t jid = -1, jsub = -1;
+    int level = 0;              // 1 above your level, -1 below (a tracked person nearby), else 0
 };
 
 std::mutex marks_mutex;
@@ -1617,6 +1618,8 @@ struct NearbyEntry {
 };
 
 CellRect nearby_area;   // simulation thread: where the list was last found
+std::vector<GridCell> nearby_cells;   // and what its cells held there (the lower layer)
+int nearby_dimx = 0, nearby_dimy = 0;
 
 // The list in the top left: per entry a symbol, maybe a word, and a
 // direction ("SSW"). Read, then emptied.
@@ -1685,6 +1688,13 @@ std::vector<NearbyEntry> take_nearby_list(const CellRect &keep) {
     const CellRect limit{0, 0, std::min(gps->dimx - 1, 40), rows};
     for (const auto &s : starts)
         area.add(drawn_area(s.first, s.second, limit, keep, 40 * rows));
+    nearby_cells.clear();
+    for (int x = std::max(0, area.x0); x <= area.x1 && x < gps->dimx; ++x)
+        for (int y = std::max(0, area.y0); y <= area.y1 && y < dimy; ++y)
+            if (!keep.has(x, y) && cell_used(x * dimy + y))
+                nearby_cells.push_back(read_cell(x * dimy + y));
+    nearby_dimx = gps->dimx;
+    nearby_dimy = dimy;
     blank_rect(area, keep);
     nearby_area = area;
     return out;
@@ -1693,7 +1703,10 @@ std::vector<NearbyEntry> take_nearby_list(const CellRect &keep) {
 // Other screens of the adventure (inventory, journal ...) show the game's
 // list too. There it is only taken off, and only where it was last found on
 // the plain screen and still looks like the list (rows ending in a
-// direction): a panel of that screen may lie in the same corner.
+// direction): a panel of that screen may lie in the same corner. Even then
+// only the cells that hold just what the list had there, in the lower layer:
+// the game's settings (Esc) lie over the list in that corner, and emptying
+// the whole rectangle cut their corner off.
 void hide_nearby_again() {
     if (!gps || nearby_area.empty())
         return;
@@ -1720,8 +1733,14 @@ void hide_nearby_again() {
                 break;
             }
     }
-    if (entries > 0 && entries * 2 >= rows)
-        blank_rect(nearby_area, CellRect());
+    if (entries == 0 || entries * 2 < rows || nearby_dimx != gps->dimx || nearby_dimy != gps->dimy)
+        return;
+    for (const GridCell &c : nearby_cells) {
+        const GridCell now = read_cell(c.idx);
+        if (std::memcmp(now.screen, c.screen, 8) == 0 && now.tex == c.tex && now.lower == c.lower &&
+            now.anchored == c.anchored)
+            write_cell(c.idx, GridCell());
+    }
 }
 
 std::string site_kind(df::world_site_type t) {
@@ -1818,7 +1837,7 @@ void publish_marks(std::vector<CompassMark> marks) {
         for (size_t i = 0; i < marks.size() && same; ++i) {
             const CompassMark &a = (*marks_model)[i], &b = marks[i];
             same = a.what == b.what && a.dist == b.dist && a.site == b.site && a.color == b.color && a.glyph == b.glyph &&
-                   a.jkind == b.jkind && a.jid == b.jid && a.jsub == b.jsub &&
+                   a.jkind == b.jkind && a.jid == b.jid && a.jsub == b.jsub && a.level == b.level &&
                    std::abs(a.bearing - b.bearing) < 0.001f;
         }
         if (same)
@@ -1979,8 +1998,12 @@ void tidy_top(bool plain) {
     if (!plain || !gps || !world || gps->dimx < 40 || gps->dimy < 20)
         return;
     if (frame_pointer.over_view && settings.game_tips) {
+        // near where the game was shown the pointer (game_pointer_spot), else the pointer itself
         int pcx = gps->dimx / 2, pcy = 0;
-        interface_cell(frame_pointer.px, frame_pointer.py, pcx, pcy);
+        if (tip_cx >= 0)
+            pcx = tip_cx;
+        else
+            interface_cell(frame_pointer.px, frame_pointer.py, pcx, pcy);
         find_tip_box(pcx);
     }
     CellRect tip;
@@ -2567,14 +2590,36 @@ void draw_compass(SDL_Renderer *sdl, int out_w, float angle) {
             const CompassMark &m = (*marks)[p.i];
             const uint32_t c = m.color ? m.color : UI_GOLD;
             const int div = p.held ? 2 : 1;
-            // a pip on the lower edge of the frame, dimmer while held at an end
-            sdl_set_render_draw_color(sdl, 0, 0, 0, 255);
-            const SDL_Rect outer = {p.x - 4, y0 + fh - 7, 9, 9};
-            sdl_render_fill_rect(sdl, &outer);
-            sdl_set_render_draw_color(sdl, Uint8(fpv::px_r(c) / div), Uint8(fpv::px_g(c) / div),
-                                      Uint8(fpv::px_b(c) / div), 255);
-            const SDL_Rect inner = {p.x - 3, y0 + fh - 6, 7, 7};
-            sdl_render_fill_rect(sdl, &inner);
+            // a pip on the lower edge of the frame, dimmer while held at an end: a
+            // square on your level, a triangle pointing up or down when above or below
+            const auto set_mark_colour = [&] {
+                sdl_set_render_draw_color(sdl, Uint8(fpv::px_r(c) / div), Uint8(fpv::px_g(c) / div),
+                                          Uint8(fpv::px_b(c) / div), 255);
+            };
+            if (m.level == 0) {
+                sdl_set_render_draw_color(sdl, 0, 0, 0, 255);
+                const SDL_Rect outer = {p.x - 4, y0 + fh - 7, 9, 9};
+                sdl_render_fill_rect(sdl, &outer);
+                set_mark_colour();
+                const SDL_Rect inner = {p.x - 3, y0 + fh - 6, 7, 7};
+                sdl_render_fill_rect(sdl, &inner);
+            } else {
+                // rows counted from the point; each row half as wide again as it is far from it
+                constexpr int TRI_H = 11;
+                const int top = y0 + fh - 9;
+                const auto tri = [&](int from, int to) {
+                    for (int j = from; j < to; ++j) {
+                        const int hw = (j - from) / 2;
+                        const int row = m.level > 0 ? top + j : top + TRI_H - 1 - j;
+                        const SDL_Rect r = {p.x - hw, row, 2 * hw + 1, 1};
+                        sdl_render_fill_rect(sdl, &r);
+                    }
+                };
+                sdl_set_render_draw_color(sdl, 0, 0, 0, 255);
+                tri(0, TRI_H);
+                set_mark_colour();
+                tri(2, TRI_H - 1);
+            }
             // its label under the compass, on the first row where it fits
             const UiTexture &t = tex_marks[p.i];
             if (!t.tex)
@@ -3074,13 +3119,49 @@ void update_menu(const std::function<void()> &redraw, const std::function<void()
             names.push_back(r.name);
         }
         if (kind == 1) {
-            std::vector<int> slot_of;
-            m->doll = m->media->bestDoll(names, slot_of);
-            for (size_t i = 0; i < m->entries.size(); ++i)
-                m->entries[i].slot = slot_of[i];
-            // the creature aimed at: each listed part's wounds, and whether it is there at all
             df::unit *target = ranged ? game->main_interface.adventure.aim_projectile.target_unit
                                       : (atk.attack_unit ? atk.attack_unit : atk.confirm_unit);
+            // The doll is chosen from the creature's whole body, lost parts too,
+            // as the player's own doll is. The game leaves a severed part out of
+            // its list, and a doll chosen from the list changed in the middle of a
+            // fight (2026-11-15: a molemarian, a centaur body, went from the
+            // four-legged doll to the legless humanoid when two legs came off).
+            std::vector<std::string> body;
+            if (target && target->body.body_plan)
+                for (size_t p = 0; p < target->body.body_plan->body_parts.size(); ++p)
+                    body.push_back(part_name(target, int(p)));
+            std::vector<int> slot_of;
+            if (!body.empty()) {
+                std::vector<int> body_slot;
+                m->doll = m->media->bestDoll(body, body_slot);
+                std::vector<bool> taken(m->doll ? m->doll->slots.size() : 0, false);
+                for (MenuEntry &e : m->entries) {
+                    const std::string want = lower_text(e.name);
+                    for (size_t p = 0; p < body.size(); ++p)
+                        if (body_slot[p] >= 0 && !taken[body_slot[p]] && lower_text(body[p]) == want) {
+                            e.slot = body_slot[p];
+                            taken[body_slot[p]] = true;
+                            break;
+                        }
+                }
+                // a lost part's place on the doll: an entry of its own, drawn "gone".
+                // After the game's rows: an entry's index is its row in the game's
+                // list (menu_input scrolls the list to it), and a gone one is never clicked.
+                for (size_t p = 0; p < body.size(); ++p)
+                    if (body_slot[p] >= 0 && !taken[body_slot[p]] && part_missing(target, int(p))) {
+                        MenuEntry e;
+                        e.name = body[p];
+                        e.slot = body_slot[p];
+                        e.cn = UI_DIM;
+                        taken[body_slot[p]] = true;
+                        m->entries.push_back(e);
+                    }
+            } else {
+                m->doll = m->media->bestDoll(names, slot_of);
+                for (size_t i = 0; i < m->entries.size(); ++i)
+                    m->entries[i].slot = slot_of[i];
+            }
+            // the creature aimed at: each listed part's wounds, and whether it is there at all
             for (MenuEntry &e : m->entries) {
                 const int bp = find_part(target, e.name);
                 if (bp < 0)

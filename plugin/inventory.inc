@@ -33,9 +33,13 @@ struct InvItem {
 struct InvSlot {
     int bp = -1;
     std::string part, label;                   // "left hand", "l. hand"
+    std::string label2;                        // a second line under the label ("held"); empty: none
     float ax = 0, ay = 0;                      // where on the body: -1..1 across as seen, 0..1 from the top
     int column = 0;                            // 0 left of the sprite, 1 right of it, 2 the row above it
     bool grasp = false, gone = false;
+    // A grasping part has two squares: what is worn on it (a gauntlet) and,
+    // under it, what it holds. This is the one for what it holds.
+    bool held = false;
     std::vector<InvItem> items;
 };
 
@@ -114,6 +118,9 @@ struct GridCopy {
     std::vector<uint8_t> screen;      // 8 bytes a cell, as gps->screen
     std::vector<long> anchored;
     std::vector<uint32_t> flag;
+    // the pictures anchored on it (flag 0), copied in the same moment: what
+    // their texture numbers named when the game drew them
+    std::unordered_map<long, std::shared_ptr<const fpv::Image>> pictures;
 } inv_grid;
 bool inv_window_erased = false;       // the game's inventory window was taken off this frame
 
@@ -189,31 +196,77 @@ std::string short_part(const std::string &name, size_t room) {
 std::unordered_map<int32_t, std::shared_ptr<const fpv::Image>> inv_pictures;   // by item id
 int32_t inv_pictures_unit = -1;
 // The picture the game itself draws beside each item in its inventory list
-// (a texture it makes per kind of item), by item id; 0: looked, none found.
-// Read off the interface grid (inventory_hook.inc); preferred to ours.
-std::unordered_map<int32_t, int32_t> inv_game_icon;
-std::unordered_map<int32_t, std::shared_ptr<const fpv::Image>> inv_icon_images;   // by texpos
+// (a texture it makes per kind of item), by item id, with the name the list
+// gave it then (a changed name, such as a waterskin filled, is looked at
+// again); img null: looked, none found. Read off the interface grid
+// (inventory_hook.inc); preferred to ours. The pixels are kept, not the
+// texture's number: the game hands freed numbers out again, and a number kept
+// from an earlier draw or an earlier world named another picture by the time
+// it was read (the thirst status icon in place of items, 2026-11-15).
+//
+// Nor is a picture taken from a single draw. The game makes these pictures on
+// its main thread: in the first frame a row is drawn, its texture number can
+// still hold what that number held before. A list page shown for one frame
+// while paging for pictures was read just then, and the copy was kept for good
+// (the thirst icon on the water in a waterskin after loading a save, again on
+// 2026-11-15). A read is now only a candidate; it becomes the item's picture
+// once the same number has shown the same pixels for ICON_STEADY_MS.
+struct GameIcon {
+    std::string name;                          // the list's name for the item when read
+    std::shared_ptr<const fpv::Image> img;     // the game's picture, once settled
+    bool done = false;                         // settled: img is it, or the game shows none
+    std::shared_ptr<const fpv::Image> cand;    // the latest read, waiting to hold steady
+    long cand_tex = 0;
+    int64_t cand_since = 0;                    // 0: nothing read yet
+    uint32_t seen = 0;                         // icon_frame when it was last read
+};
+std::unordered_map<int32_t, GameIcon> inv_game_icon;
+uint32_t icon_frame = 0;                       // counts collect_game_icons' frames
+constexpr int64_t ICON_STEADY_MS = 250;
+constexpr int64_t ICON_WAIT_MS = 2000;         // no picture, or one that keeps changing: taken as it is then
 
-std::shared_ptr<const fpv::Image> inv_icon_image(int32_t texpos) {
-    const auto found = inv_icon_images.find(texpos);
-    if (found != inv_icon_images.end())
-        return found->second;
-    std::shared_ptr<fpv::Image> img;
-    uint32_t raw[fpv::TEXPIX];
-    if (fpv::TextureStore::readSprite(texpos, raw)) {
-        img = std::make_shared<fpv::Image>();
-        img->w = img->h = fpv::TEX;
-        img->px.assign(raw, raw + fpv::TEXPIX);
+int64_t icon_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+bool same_picture(const std::shared_ptr<const fpv::Image> &a, const std::shared_ptr<const fpv::Image> &b) {
+    if (!a || !b)
+        return !a && !b;
+    return a == b || (a->w == b->w && a->h == b->h && a->px == b->px);
+}
+
+// one read of the picture the game drew for an item this frame
+void note_game_icon(int32_t id, const std::string &name, long tex, std::shared_ptr<const fpv::Image> img) {
+    GameIcon &g = inv_game_icon[id];
+    if (g.name != name)
+        g = GameIcon{name};   // filled, renamed: another picture is to be expected
+    g.seen = icon_frame;
+    const int64_t now = icon_ms();
+    if (!g.cand_since || g.cand_tex != tex || !same_picture(g.cand, img)) {
+        g.cand = std::move(img);
+        g.cand_tex = tex;
+        g.cand_since = now;
+        return;
     }
-    inv_icon_images[texpos] = img;
-    return img;
+    // no picture yet is waited out longer: the game may still be making it
+    if (now - g.cand_since >= (g.cand ? ICON_STEADY_MS : ICON_WAIT_MS)) {
+        g.img = g.cand;
+        g.done = true;
+    }
+}
+
+// Item ids and pictures belong to one world and one adventurer.
+void inv_forget_pictures() {
+    inv_pictures.clear();
+    inv_game_icon.clear();
+    inv_grid.pictures.clear();
 }
 
 std::shared_ptr<const fpv::Image> inv_picture(df::item *it) {
     const auto game_icon = inv_game_icon.find(it->id);
-    if (game_icon != inv_game_icon.end() && game_icon->second > 0)
-        if (std::shared_ptr<const fpv::Image> img = inv_icon_image(game_icon->second))
-            return img;
+    if (game_icon != inv_game_icon.end() && game_icon->second.img)
+        return game_icon->second.img;
     const auto found = inv_pictures.find(it->id);
     if (found != inv_pictures.end())
         return found->second;
@@ -264,11 +317,13 @@ std::string read_burden() {
 // holds things (head, upper and lower body, grasping and standing parts) and
 // any other part that has something on it. Where on the body each lies is
 // made up from what it is and what it hangs from.
-void inv_slots(df::unit *adv, const std::vector<bool> &holds, InvModel &m, std::vector<int> &slot_of) {
+void inv_slots(df::unit *adv, const std::vector<bool> &holds, InvModel &m, std::vector<int> &slot_of,
+               std::vector<int> &held_of) {
     const auto &parts = adv->body.body_plan->body_parts;
     using F = df::body_part_raw_flags;
     const size_t n = parts.size();
     slot_of.assign(n, -1);
+    held_of.assign(n, -1);
     const auto flag = [&](size_t bp, F f) { return parts[bp] && parts[bp]->flags.is_set(f); };
     // the parts a head hangs from (a neck)
     std::vector<bool> to_head(n, false);
@@ -320,7 +375,18 @@ void inv_slots(df::unit *adv, const std::vector<bool> &holds, InvModel &m, std::
         s.ax = flag(bp, F::LEFT) ? out : flag(bp, F::RIGHT) ? -out : 0.0f;
         s.column = flag(bp, F::HEAD) ? 2 : flag(bp, F::RIGHT) ? 0 : flag(bp, F::LEFT) ? 1 : -1;
         slot_of[bp] = int(m.slots.size());
-        m.slots.push_back(std::move(s));
+        if (s.grasp) {
+            // right after it (and kept so): the square for what it holds
+            InvSlot h = s;
+            h.held = true;
+            h.label2 = "held";
+            h.ay += 0.001f;
+            m.slots.push_back(std::move(s));
+            held_of[bp] = int(m.slots.size());
+            m.slots.push_back(std::move(h));
+        } else {
+            m.slots.push_back(std::move(s));
+        }
     }
     if (m.slots.empty() && n > 0 && parts[0]) {
         // nothing of the usual kinds (a blob): the body itself
@@ -337,16 +403,23 @@ void inv_slots(df::unit *adv, const std::vector<bool> &holds, InvModel &m, std::
     std::vector<size_t> middle;
     int count[2] = {0, 0};
     for (size_t i = 0; i < m.slots.size(); ++i) {
-        if (m.slots[i].column < 0)
-            middle.push_back(i);
-        else if (m.slots[i].column < 2)
+        if (m.slots[i].column < 0) {
+            if (!m.slots[i].held)
+                middle.push_back(i);
+        } else if (m.slots[i].column < 2) {
             ++count[m.slots[i].column];
+        }
     }
     std::stable_sort(middle.begin(), middle.end(), [&](size_t a, size_t b) { return m.slots[a].ay < m.slots[b].ay; });
     for (size_t i : middle) {
         const int side = count[1] < count[0] ? 1 : 0;
         m.slots[i].column = side;
         ++count[side];
+        // a hand's held square stays on the side of its worn one
+        if (i + 1 < m.slots.size() && m.slots[i + 1].held && m.slots[i + 1].bp == m.slots[i].bp) {
+            m.slots[i + 1].column = side;
+            ++count[side];
+        }
     }
 }
 
@@ -490,7 +563,7 @@ std::shared_ptr<InvModel> read_inventory(df::unit *adv) {
     if (!adv || !adv->body.body_plan)
         return m;
     if (inv_pictures_unit != adv->id) {
-        inv_pictures.clear();
+        inv_forget_pictures();
         inv_pictures_unit = adv->id;
     }
     // the creature's own picture
@@ -535,6 +608,7 @@ std::shared_ptr<InvModel> read_inventory(df::unit *adv) {
         int bp;
         uint32_t flags;
         std::string name;
+        bool held;      // in the part's grasp, not worn on it
     };
     std::vector<Entry> entries;
     const auto &main = inv.option[df::adventure_inventory_option_list_type::MAIN];
@@ -542,16 +616,18 @@ std::shared_ptr<InvModel> read_inventory(df::unit *adv) {
         auto *io = o ? virtual_cast<df::adventure_option_inventory_itemst>(o) : nullptr;
         if (!io || !io->item)
             continue;
+        using R = df::inv_item_role_type;
+        const bool held = io->invitem && (io->invitem->mode == R::Weapon || io->invitem->mode == R::Hauled);
         entries.push_back({io->item, std::max(0, int(io->depth)),
                            io->invitem ? int(io->invitem->body_part_id) : -1, io->option_flag.whole,
-                           option_text(io, false)});
+                           option_text(io, false), held});
     }
     std::vector<bool> holds(parts.size(), false);
     for (const Entry &e : entries)
         if (e.depth == 0 && e.bp >= 0 && size_t(e.bp) < parts.size())
             holds[e.bp] = true;
-    std::vector<int> slot_of;
-    inv_slots(adv, holds, *m, slot_of);
+    std::vector<int> slot_of, held_of;
+    inv_slots(adv, holds, *m, slot_of, held_of);
 
     std::unordered_map<int32_t, size_t> group_of;   // container item id -> its group
     const auto group = [&](int32_t id, const std::string &title) -> InvGroup & {
@@ -575,7 +651,9 @@ std::shared_ptr<InvModel> read_inventory(df::unit *adv) {
         it.flags = e.flags;
         it.count = std::max(1, int(e.item->getStackSize()));
         if (e.depth == 0) {
-            const int s = e.bp >= 0 && size_t(e.bp) < slot_of.size() ? slot_of[e.bp] : -1;
+            int s = e.bp >= 0 && size_t(e.bp) < slot_of.size() ? slot_of[e.bp] : -1;
+            if (s >= 0 && e.held && held_of[e.bp] >= 0)
+                s = held_of[e.bp];
             if (s >= 0)
                 m->slots[s].items.push_back(it);
             else
@@ -657,7 +735,7 @@ std::shared_ptr<InvModel> read_inventory(df::unit *adv) {
     for (const std::string &p : m->popup)
         all += "|" + p;
     for (const InvSlot &s : m->slots) {
-        all += "#" + std::to_string(s.bp) + (s.gone ? "x" : "");
+        all += "#" + std::to_string(s.bp) + (s.gone ? "x" : "") + (s.held ? "h" : "");
         for (const InvItem &it : s.items)
             all += "," + std::to_string(it.id) + "x" + std::to_string(it.count) + it.name +
                    std::to_string(uintptr_t(it.pic.get()));
@@ -954,13 +1032,15 @@ bool layout_inv(const InvModel &m, int scroll, InvLayout &L) {
             spot(m.slots[i], px, py);
             ys.push_back(py - L.Q / 2);
         }
+        // a square's height with its label (two lines for a held one)
+        const auto step = [&](size_t k) { return row_h + (m.slots[list[k]].label2.empty() ? 0 : lab_h); };
         // apart enough, pushed down, then back up from the bottom
         for (size_t k = 0; k < ys.size(); ++k)
-            ys[k] = std::max(ys[k], k ? ys[k - 1] + row_h : body_top);
+            ys[k] = std::max(ys[k], k ? ys[k - 1] + step(k - 1) : body_top);
         for (size_t k = ys.size(); k-- > 0;)
-            ys[k] = std::min(ys[k], k + 1 < ys.size() ? ys[k + 1] - row_h : bottom - row_h + 6);
+            ys[k] = std::min(ys[k], k + 1 < ys.size() ? ys[k + 1] - step(k) : bottom - step(k) + 6);
         for (size_t k = 0; k < ys.size(); ++k)
-            ys[k] = std::max(ys[k], k ? ys[k - 1] + row_h : top);
+            ys[k] = std::max(ys[k], k ? ys[k - 1] + step(k - 1) : top);
         const int x = col == 0 ? pad + (L.col_w - L.Q) / 2 : L.sprite_x + s + L.gap + (L.col_w - L.Q) / 2;
         for (size_t k = 0; k < list.size(); ++k)
             add_slot(list[k], x, ys[k]);
@@ -1371,6 +1451,11 @@ void paint_inv(const InvModel &m, const InvLayout &L, const InvBox &hover, int32
         const int lw = int(sl.label.size()) * 8;
         panel_text(cv, b.x + (b.w - lw) / 2, b.y + b.h + 2, sl.label, sl.gone ? UI_DIM : fpv::rgb(200, 190, 160), 8,
                 12);
+        if (!sl.label2.empty()) {
+            const int lw2 = int(sl.label2.size()) * 8;
+            panel_text(cv, b.x + (b.w - lw2) / 2, b.y + b.h + 2 + 12, sl.label2,
+                       sl.gone ? UI_DIM : fpv::rgb(200, 190, 160), 8, 12);
+        }
     }
     for (const InvBox &b : L.boxes) {
         if (b.kind != INV_SLOT_ITEM)
@@ -1586,10 +1671,11 @@ void draw_inventory(SDL_Renderer *sdl) {
         if (const InvItem *it = inv_item_at(*m, hover)) {
             tip = it->name;
             if (hover.kind == INV_SLOT_ITEM)
-                tip += " (" + m->slots[hover.a].part + ")";
+                tip += m->slots[hover.a].held ? " (held in " + m->slots[hover.a].part + ")"
+                                              : " (" + m->slots[hover.a].part + ")";
         } else if (hover.kind == INV_SLOT) {
             const InvSlot &sl = m->slots[hover.a];
-            tip = sl.part + (sl.gone ? ": gone" : sl.items.empty() ? ": nothing" : "");
+            tip = sl.part + (sl.held ? ", held" : "") + (sl.gone ? ": gone" : sl.items.empty() ? ": nothing" : "");
         }
     }
     if (!tip.empty()) {

@@ -77,6 +77,7 @@ struct RenderOptions {
     const Precip *precip = nullptr;
     const Weather *weather = nullptr;
     int wave_frame = 0;          // the step of the waves' animation (Cell::water, CELL_WAVES)
+    bool sight = false;          // darken by what the adventurer sees (Scene::sight, sight.h)
 };
 
 class WorkerPool {
@@ -124,6 +125,7 @@ private:
         int16_t a, b;       // rows [a, b)
         float depth;
         int16_t tx, ty, tz; // map tile it belongs to (-1 for sky, -2 for the far land)
+        float da, db;       // distance at its first and last row (for the light: Scene::sight)
     };
     static constexpr int MAX_SPANS = 64;
 
@@ -164,6 +166,7 @@ private:
         uint8_t texx;
         int16_t tx, ty, tz;
         int16_t shade;
+        int16_t keep;       // light on it, 0..256 (Scene::sight)
     };
     static constexpr int MAX_MASKED = 6;
     std::vector<Masked> masked_;        // W * MAX_MASKED, near to far

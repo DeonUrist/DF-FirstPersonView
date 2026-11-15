@@ -27,6 +27,7 @@ dfhack_plugin(fpview
     render3d.cpp
     gpu.cpp
     scene.cpp
+    sight.cpp
     sky.cpp
     sound.cpp
     spatter.cpp

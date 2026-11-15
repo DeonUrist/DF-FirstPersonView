@@ -13,7 +13,6 @@ void panels_logic() {
     }
     auto &inv = game->main_interface.adventure.inventory;
     if (++panel_switch_tries > 300) {
-        mouse_log.push_back("panels: gave up switching to " + std::string(PT_NAMES[want]));
         panel_switch = -1;
         return;
     }

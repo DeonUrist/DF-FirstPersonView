@@ -235,10 +235,31 @@ const char *dir8(double dx, double dy) {
     return D[k];
 }
 
+// While travelling the adventurer's unit is gone (the game puts the local map
+// away; World::getAdventurer is null, read 2026-11-15). Its place is then its
+// army's on the travel map, in steps of 16 tiles (army.pos, abs_smm), or where
+// the travel map was opened until the first step there (travel_not_moved).
+bool travel_smm(int &x, int &y) {
+    if (!adventure || adventure->menu != df::ui_advmode_menu::Travel)
+        return false;
+    const df::army *a = adventure->travel_not_moved ? nullptr : df::army::find(adventure->player_army_id);
+    x = a ? a->pos.x : adventure->travel_origin_x;
+    y = a ? a->pos.y : adventure->travel_origin_y;
+    return x >= 0 && y >= 0;
+}
+
 // Where the adventurer is, in tiles of the whole world.
 bool adv_tile(double &gx, double &gy) {
     df::unit *adv = World::getAdventurer();
-    if (!adv || !world)
+    if (!adv) {
+        int sx, sy;
+        if (!travel_smm(sx, sy))
+            return false;
+        gx = sx * 16.0 + 8;
+        gy = sy * 16.0 + 8;
+        return true;
+    }
+    if (!world)
         return false;
     gx = world->map.region_x * 48.0 + adv->pos.x + 0.5;
     gy = world->map.region_y * 48.0 + adv->pos.y + 0.5;
@@ -344,9 +365,12 @@ std::string creature_name(int race) {
     return c ? c->name[0] : "";
 }
 
+// the adventurer's figure; while travelling (no unit) through its nemesis record
 df::historical_figure *adv_figure() {
-    df::unit *adv = World::getAdventurer();
-    return adv ? df::historical_figure::find(adv->hist_figure_id) : nullptr;
+    if (df::unit *adv = World::getAdventurer())
+        return df::historical_figure::find(adv->hist_figure_id);
+    df::nemesis_record *n = adventure ? df::nemesis_record::find(adventure->player_id) : nullptr;
+    return n ? n->figure : nullptr;
 }
 
 df::knowledge_profilest *my_knowledge() {
@@ -1818,6 +1842,14 @@ void add_tracked_marks(std::vector<CompassMark> &marks) {
                 m.jsub = r.sub;
                 if (r.kind == JK_SITE)
                     m.site = r.id;
+                // a person in the loaded area: above or below your level
+                if (r.kind == JK_PERSON)
+                    if (df::historical_figure *hf = df::historical_figure::find(r.id))
+                        if (df::unit *u = hf->unit_id >= 0 ? df::unit::find(hf->unit_id) : nullptr)
+                            if (df::unit *adv = World::getAdventurer(); adv && Units::isActive(u)) {
+                                const int dz = u->pos.z - adv->pos.z;
+                                m.level = dz > 0 ? 1 : dz < 0 ? -1 : 0;
+                            }
                 cache.push_back(m);
             }
     }
@@ -2827,12 +2859,19 @@ void journal_takeover() {
 // the main thread reallocate every array of the map viewport; the game crashed
 // twice that way (2026-11-15: a black screen, then memset into a null array of
 // gps->main_viewport on the main thread), and once froze with a corrupted heap.
+// On the travel map its own journal key and button (the book at the bottom left)
+// do the same.
 bool journal_key(std::set<df::interface_key> *input) {
-    if (!settings.journal_panel || !ui_font_ready || !game || !plain_adventure_focus())
+    if (!settings.journal_panel || !ui_font_ready || !game)
         return false;
-    const bool key = input && input->count(df::interface_key::A_LOG);
-    const bool click = enabler->mouse_lbut &&
-                       game->main_interface.current_hover == df::main_hover_instruction::ADVENTURE_LOG;
+    const bool travel = travel_map_ours();
+    if (!travel && !plain_adventure_focus())
+        return false;
+    using H = df::main_hover_instruction;
+    const H hover = game->main_interface.current_hover;
+    const bool key = input && (input->count(df::interface_key::A_LOG) ||
+                               (travel && input->count(df::interface_key::A_TRAVEL_LOG)));
+    const bool click = enabler->mouse_lbut && (hover == H::ADVENTURE_LOG || (travel && hover == H::ADVENTURE_TRAVEL_LOG));
     if (!key && !click)
         return false;
     if (click) {
@@ -2995,7 +3034,7 @@ int journal_input(std::set<df::interface_key> *input) {
     if (!input)
         return 1;
     if (jr.view == 1) {
-        if (input->count(LEAVESCREEN) || input->count(A_LOG))
+        if (input->count(LEAVESCREEN) || input->count(A_LOG) || input->count(A_TRAVEL_LOG))
             jr_close();
         return 1;
     }
@@ -3029,7 +3068,7 @@ int journal_input(std::set<df::interface_key> *input) {
         }
         return 1;
     }
-    if (input->count(A_LOG)) {
+    if (input->count(A_LOG) || input->count(A_TRAVEL_LOG)) {
         jr_close();
         return 1;
     }
@@ -3053,7 +3092,9 @@ int journal_input(std::set<df::interface_key> *input) {
 // once a frame, after the game has drawn: whether the panel is up, the wheel
 void journal_frame(bool on_top) {
     df::unit *adv = World::getAdventurer();
-    if (adv && gps)
+    // on the travel map the view is off and the adventurer's unit gone; the panel works there too
+    const bool travel = !adv && travel_map_ours();
+    if ((adv || travel) && gps)
         load_game_art();
     // under the game's inventory (closing for a switch to here, or opened over the
     // journal) the panel waits and comes back
@@ -3062,8 +3103,9 @@ void journal_frame(bool on_top) {
         cover_x1 = -1;
         return;
     }
-    const bool usable = jr.want && active && showing && settings.journal_panel && game && gps && adv && ui_font_ready &&
-                        on_top && !game->main_interface.view_sheets.open;
+    const bool here = (active && showing && adv) || travel_map_ours();
+    const bool usable = jr.want && here && settings.journal_panel && game && gps && ui_font_ready && on_top &&
+                        !game->main_interface.view_sheets.open;
     if (!usable) {
         if (jr_up)
             jr_close();

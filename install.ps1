@@ -11,6 +11,11 @@
         into <DF>\hack\plugins. It has to be built for the exact DFHack
         version in use: run plugin\build.ps1 first.
 
+    A copy of the plugin also goes into the mod's dfhack_plugin folder, with
+    the DFHack version it was built for. That is what the Steam Workshop
+    delivers: first-person.lua copies it into hack\plugins at the title screen
+    (DFHack loads plugins only from there). Upload the installed mod folder.
+
     With -Link the script mod is linked to this repository instead of copied,
     so edits made here are picked up without reinstalling.
 
@@ -40,6 +45,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $source = $PSScriptRoot
 $target = Join-Path $ModsDir 'first_person_view'
+$dll = Get-ChildItem (Join-Path $source '_refs\dfhack\build') -Recurse -Filter 'fpview.plug.dll' -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
 
 if (-not (Test-Path $ModsDir)) {
     throw "Mods folder not found: $ModsDir (pass -ModsDir to point at your install)"
@@ -79,12 +86,26 @@ if ($Link) {
         Remove-Item $keep -Recurse -Force
         Write-Host "Kept the art already in $media"
     }
+    if ($dll) {
+        # the plugin as the Workshop delivers it, and the DFHack it was built for
+        $shipped = Join-Path $target 'dfhack_plugin'
+        New-Item -ItemType Directory -Path $shipped | Out-Null
+        Copy-Item $dll.FullName $shipped
+        $cmake = Get-Content (Join-Path $source '_refs\dfhack\CMakeLists.txt') -Raw
+        $dfv = if ($cmake -match 'set\(DF_VERSION "([^"]+)"\)') { $Matches[1] }
+        $rel = if ($cmake -match 'set\(DFHACK_RELEASE "([^"]+)"\)') { $Matches[1] }
+        if ($dfv -and $rel) {
+            Set-Content (Join-Path $shipped 'dfhack_version.txt') "$dfv-$rel" -NoNewline -Encoding ascii
+        } else {
+            Write-Warning 'DFHack version not found in _refs\dfhack\CMakeLists.txt; the mod will not check it'
+        }
+    } else {
+        Write-Warning 'fpview.plug.dll has not been built yet: the mod folder has no plugin for the Workshop.'
+    }
     Write-Host "Installed script mod to $target"
 }
 
 # --- plugin ---
-$dll = Get-ChildItem (Join-Path $source '_refs\dfhack\build') -Recurse -Filter 'fpview.plug.dll' -ErrorAction SilentlyContinue |
-    Sort-Object LastWriteTime -Descending | Select-Object -First 1
 $plugins = Join-Path $DFPath 'hack\plugins'
 if ($NoPlugin) {
     return

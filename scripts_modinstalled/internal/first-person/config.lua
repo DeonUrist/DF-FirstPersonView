@@ -31,6 +31,8 @@ SCHEMA = {
         desc='Maximum depth: how many z-levels below you are drawn'},
     far_land={default=true, kind='boolean', plugin=true,
         desc='Far land: beyond the loaded map, draw the land out to the horizon from the world map (heights, biomes, sea and lakes, trees), and haze by the horizon instead of the draw distance'},
+    visibility_gradient={default=true, kind='boolean', plugin=true,
+        desc="Visibility gradient: what you cannot see (the game's line of sight, short in the dark and indoors) is dark, with a fade towards it; under a roof everything is a little darker; under the open sky only at night"},
     horizon={default=20000, kind='number', min=500, max=60000, plugin=true,
         desc='Horizon: how far the far land reaches, in tiles (also the distance at which everything has faded into haze)'},
     far_trees={default=1400, kind='number', min=0, max=1400, plugin=true,
@@ -83,7 +85,7 @@ SCHEMA = {
         desc='switch to first person automatically when an adventure is loaded'},
 }
 
-ORDER = {'hotkey', 'fov', 'resolution', 'view_distance', 'range', 'max_height', 'max_depth', 'far_land', 'horizon', 'far_trees', 'model_lines',
+ORDER = {'hotkey', 'fov', 'resolution', 'view_distance', 'range', 'max_height', 'max_depth', 'far_land', 'visibility_gradient', 'horizon', 'far_trees', 'model_lines',
          'relative_controls', 'smooth', 'compass', 'compass_markers', 'cursor_hint', 'minimap', 'enemy_list', 'minimap_ascii', 'minimap_tiles', 'wasd', 'mouse_look', 'combat_menus', 'inventory_panel', 'journal_panel', 'radial_menu', 'game_tips', 'body_doll', 'status_bars', 'any_conflict_discs', 'auto_attack',
          'realtime_rate', 'hardware_renderer', 'start_enabled'}
 

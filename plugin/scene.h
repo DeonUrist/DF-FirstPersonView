@@ -24,6 +24,7 @@
 
 #include "common.h"
 #include "models.h"
+#include "sight.h"
 #include "spatter.h"
 #include "textures.h"
 
@@ -327,6 +328,9 @@ public:
     // any_conflict: conflicts between others count too (disc and colour); otherwise only those with you.
     void buildUnits(int zlo, int zhi, const df::unit *self, uint32_t frame, bool outlines, bool melee_reach,
                     bool smooth_units, bool any_conflict);
+
+    // what the adventurer sees, as light on the world (setting visibility_gradient; off: all lit)
+    SightMap sight;
 
     // the land beyond the loaded map (null: none); replaced whole, never changed in place but by shift()
     std::shared_ptr<FarView> far;

@@ -189,8 +189,9 @@ The colours are the game's own, and the letters are spelled out at the bottom of
 (fingers, eyes, teeth ...) are in compact columns next to the doll. Pointing at anything shows the game's
 full text for it. A part of the target that is hurt carries the cut or bruise mark of your own doll just
 above its letters, and pointing at it shows the same hint of its wounds as your doll does. A part that is
-gone (cut off, destroyed) says "gone" in red, on the doll and in the columns, and cannot be clicked. The doll is picked by the body parts the creature has; a creature that fits none of them
-gets the list alone.
+gone (cut off, destroyed) says "gone" in red, on the doll and in the columns, and cannot be clicked. The doll is picked by the body parts the creature's kind has, lost
+ones included, so it stays the same however much of the creature is cut off; a creature that fits none
+of them gets the list alone.
 
 What to attack with follows in the same style: the attacks in a short list and the six options (quick,
 heavy, wild, precise, charge, multi-attack) as check boxes in two columns.
@@ -198,6 +199,16 @@ heavy, wild, precise, charge, multi-attack) as check boxes in two columns.
 Both menus are mouse menus: click an entry, or **Cancel** / Esc / right click to leave. `first-person set
 combat_menus false` brings the game's own lists back. They also show when the attack was started from
 the keyboard.
+
+### Jumping
+
+With the game's jump open (**J**, or jump on the action ring), a gold square lies on every tile you can
+jump to, at the height of the floor you stand on, also over a pit or a drop (that is how you jump down).
+The pointer becomes the jump picture, the square under it lights up, and a click on a square jumps there,
+even where it hangs in the air. A standing jump goes exactly two tiles; with a run-up (momentum) it goes
+3 to 5 tiles ahead, by your speed, as the game works it out. The game's own cursor keys and Enter still
+work; its cursor's square is lit while the pointer is on none. The squares need the game's SDL to have
+`SDL_RenderGeometry` (as the graphics card renderer does).
 
 ### The inventory panel
 
@@ -214,7 +225,9 @@ game's own font, and "Burden" shows a weight sign (`media/weight.png`) where the
   something on it), so other bodies (four arms, claws, a tail) get their own squares. Under each square
   its name, shortened to fit: "left hand" is "l. hand", and a name still too long is cut to the first
   letters of its words ("upper left big sharp claw" becomes "ULBSC"). What is worn or held on a part
-  is shown in its square, several things side by side in it.
+  is shown in its square, several things side by side in it. A grasping part (a hand) has two squares:
+  the upper one for what is worn on it (a gauntlet), the one under it, labelled with its name and
+  "held", for what it holds.
 - The rest of the panel is what you carry: a block for each container (backpack, quiver, pouch, a
   waterskin and what is in it, a loaded crossbow and its bolt) with a square for each thing in it, at
   the size the game draws a tile, with the picture the game itself shows for it in its inventory. Empty
@@ -225,7 +238,7 @@ game's own font, and "Burden" shows a weight sign (`media/weight.png`) where the
   scrollbar turned on its side, or the wheel) when it is longer than the panel. A click on a thing there
   offers **Pick up** (the game's own pick-up) and, for a stack, **Split stack**. When the game asks how
   many of a stack to pick up, the panel's own dialog asks instead (slider or typed number, OK or Cancel). Drag it onto a body part
-  to pick it up and wear it (onto a hand: just pick it up), into a container to pick it up and put it
+  to pick it up and wear it (onto a hand's "held" square: just pick it up), into a container to pick it up and put it
   there, onto a stack of the same thing to share them out. Drag something you carry onto the row to drop
   it (taken off first if worn).
 - Dragging something you wear into a container takes it off and then puts it in.
@@ -318,10 +331,19 @@ opens the mod's journal instead, in the same room as the inventory panel.
   the sites you know (pale dots); squares you have not uncovered are dark.
 - **Tracking**: the square box at the left of each entry (and before a page's title) tracks it. A
   tracked entry is marked on the compass, first among the marks, in yellow with a check mark, and a
-  click on its label opens its page. The box is yellow when where it is is known, grey when not; a grey
+  click on its label opens its page. A tracked person in the loaded area is marked with a triangle
+  pointing up when they are on a level above yours and down when below; on your level, and for
+  everything else, the mark is a square. The box is yellow when where it is is known, grey when not; a grey
   one can still be ticked and shows on the compass once its place becomes known. Tracked entries are
   kept per save in `dfhack-config/fpview-tracked.txt`.
 - "Game journal" opens the game's own journal.
+
+On the game's **travel map** (while the view is on when you start travelling) every tracked entry is
+marked too: an exclamation mark in its colour over its square, with its name in the small font under
+the square. An entry that is off the travel map waits at the map's edge, on the line from you towards
+it, with an arrow pointing its way and its distance under the name, the way the compass holds the
+places outside its window. The travel map's journal button (the book at the bottom left) and its key
+open the mod's journal there instead of the game's.
 
 `first-person set journal_panel false` brings back the game's own journal.
 
@@ -351,10 +373,7 @@ The sky shows what the game has where you are (outdoors; underground there is no
   thing's colour. An evil cloud creeping near covers the sky with dark clouds of its own colour, and
   tints the haze in it.
 
-Changes of weather come over a few seconds. "Weather (debug)" in the settings (the gear) picks a weather
-to test with, from None (the real weather) through Clear, Cumulus, Many cumulus, Cirrus, Altostratus,
-Overcast, Mist, Fog, Thick fog, Rain, Storm, Snow, Blood rain and Evil cloud. It is not stored: every
-game starts with the real weather. `first-person status` shows the weather the sky is drawn from.
+Changes of weather come over a few seconds. `first-person status` shows the weather the sky is drawn from.
 
 ### The land beyond the map (far land)
 
@@ -458,7 +477,13 @@ When developing: do not `unload`/`load` the plugin while an adventure is loaded.
 | `first-person` script (Lua) | DF `mods` folder | hotkey and saved settings |
 
 The plugin is native code, so it has to be built for the exact DFHack version you run and
-rebuilt when DFHack updates. It is not something the Steam Workshop can deliver.
+rebuilt when DFHack updates. DFHack loads plugins only from `hack/plugins`, never from a mod, so the
+mod carries a copy in its `dfhack_plugin` folder (with `dfhack_version.txt`, the DFHack it was built
+for) and `first-person.lua` copies it into `hack/plugins` and loads it at the title screen: on the first
+start, and again whenever a mod update brings a different file (unloading the old one first). With
+another DFHack version installed it leaves the plugin alone and says so in a message. Windows only.
+To publish on the Steam Workshop, run `install.ps1` (or `plugin\build.ps1 -Install`) and upload the
+installed `mods\first_person_view` folder from the game.
 
 ## Build and install
 
@@ -589,6 +614,7 @@ Stored in `<DF>/dfhack-config/mods/first_person_view/settings.json`.
 | `max_height` | `24` | Maximum height: z-levels drawn above you (0 to 999, up to the top of the map). Also in the settings behind the gear (U). Many levels cost memory and frame time |
 | `max_depth` | `8` | Maximum depth: z-levels drawn below you (0 to 999, down to the bottom of the map). Also in the settings behind the gear (N). Many levels cost memory and frame time |
 | `far_land` | `true` | Far land: the land beyond the loaded map, out to the horizon, from the world map (see "The land beyond the map"); haze then goes by `horizon`. Also in the settings behind the gear (L) |
+| `visibility_gradient` | `true` | Visibility gradient: what the game says you cannot see (its line of sight, which is short in the dark and indoors) is black, and what you see fades towards it over about five tiles of open ground (not through walls); under a roof everything is a little darker (80%). Under the open sky it only applies while the sun is down (fading in at dusk and out at dawn); by day the outdoors is fully lit. The land beyond the map is as dark as the edge of the map near it. Also in the settings behind the gear (V) |
 | `horizon` | `20000` | Horizon: how far the far land reaches, in tiles (500 to 60000), and the distance at which everything has faded into haze. Also in the settings (Z) |
 | `far_trees` | `1400` | Far trees: how far trees are drawn as trees (blocks) beyond the draw distance, in tiles (0 to 1400; 0: none; at most the nearest 6000, beyond them dense woods are blocks of canopy). Also in the settings (T) |
 | `model_lines` | `1` | dark lines along the edges of every face of furniture, stairs and other models, this many game pixels wide (a tile is 32), so they look like the game's outlined pixel art; `0` turns them off. Faces with the game's own picture on them (cabinet doors, signs) get none |
@@ -600,7 +626,7 @@ Stored in `<DF>/dfhack-config/mods/first_person_view/settings.json`.
 | `minimap` | `true` | top-down map in the top right corner ("Minimap" in the settings) |
 | `enemy_list` | `true` | the row of pictures of the creatures in a conflict with you ("Enemy list" in the settings) |
 | `auto_attack` | `false` | walking into a creature you are in a conflict with strikes it ("Auto attack" in the settings); off, you step onto its tile instead if the game lets you |
-| `hardware_renderer` | `true` | draw the view on the graphics card instead of in software. The camera then really tilts: you can look straight up (at birds overhead) or straight down without the picture stretching. It goes through the game's own SDL renderer, so it works wherever the game does (Windows or Linux, any maker of graphics card); if the game's SDL cannot do it, the software renderer is used. `resolution` does not apply to it: it always draws at the window's full size. The gear next to the minimap opens the settings with this ("Hardware renderer"), `cursor_hint`, `compass`, `compass_markers`, `minimap`, `enemy_list`, `auto_attack`, the `fov` slider and the weather slider for testing |
+| `hardware_renderer` | `true` | draw the view on the graphics card instead of in software. The camera then really tilts: you can look straight up (at birds overhead) or straight down without the picture stretching. It goes through the game's own SDL renderer, so it works wherever the game does (Windows or Linux, any maker of graphics card); if the game's SDL cannot do it, the software renderer is used. `resolution` does not apply to it: it always draws at the window's full size. The gear next to the minimap opens the settings with this ("Hardware renderer"), `cursor_hint`, `compass`, `compass_markers`, `minimap`, `enemy_list`, `auto_attack`, `far_land`, `visibility_gradient`, the distances and heights, and the `fov` slider |
 | `inventory_panel` | `true` | the mod's inventory panel (your picture with a square per body part, what you carry as squares, drag and drop) in place of the game's inventory screen while the view is on (see "The inventory panel") |
 | `journal_panel` | `true` | the mod's journal panel (both names of everything, where it is, every name a link) in place of the game's journal while the view is on (see "The journal panel") |
 | `realtime_rate` | `5` | game ticks a second while the timer button lets time pass by itself (1 to 99; a wait is 10; the mouse wheel over the button changes it) |
@@ -675,13 +701,12 @@ Only what your adventurer has seen is drawn, because that is all the game draws.
   (`G_FPS_CAP` in the game's settings); the view cannot be smoother than that.
 - Terrain outside the map window around you is refreshed in rotation, so far-away changes and
   far-away creatures can take a second or two to show up.
-- Mouse dragging is only used in the inventory panel.
-- You cannot look up or down yet.
+- With the software renderer (`hardware_renderer false`) looking up or down only slides the picture,
+  so it stretches near the top and bottom.
 - Tree trunks are blocks, so trees are square.
 - A ramp's direction is worked out from the walls around it, not from where the game lets you
   walk up, so an unusual ramp can slope the wrong way.
 - Creatures and items are flat sprites that always face you.
-- Night is not darkened, apart from the sky and haze.
 
 ## Layout
 

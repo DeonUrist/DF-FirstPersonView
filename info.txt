@@ -5,16 +5,14 @@
 [EARLIEST_COMPATIBLE_DISPLAYED_VERSION:0.1.0]
 [AUTHOR:SET_YOUR_NAME_HERE]
 [NAME:First Person View]
-[DESCRIPTION:Press a hotkey (Ctrl-Shift-F by default) in adventure mode to see the world in first person. The view is ray-cast from the game's own sprites and shows several z-levels at once: hills, pits, upper floors and tree canopies. The normal adventure interface keeps working on top of it. Requires DFHack and the fpview plugin that comes with this mod's source.]
+[DESCRIPTION:Adventure mode in first person. Press Ctrl-Shift-F or the camera button and the map becomes a 3D world drawn with the game's own art, with a sky, the land out to the horizon, one-click combat with paperdoll aiming, and new inventory and journal panels. Requires DFHack, Windows.]
 
 [STEAM_TITLE:First Person View]
 [STEAM_DESCRIPTION:Adventure mode in first person.
 
-Press Ctrl-Shift-F (configurable) while playing an adventurer and the map turns into a first-person 3D view, drawn with the sprites the game already uses for the tiles, plants, items and creatures around you. Several z-levels are drawn at once, so you see hills, pits, multi-storey buildings and tree canopies. The rest of the adventure mode interface keeps working on top of the view, and pressing the hotkey again brings the normal map back.
+Press Ctrl-Shift-F or the camera button and the map turns into a 3D world built from the game's own art. Several levels are drawn at once, the land goes on to the horizon under a real sky, and the rest of the game keeps working around it. Press it again to get the normal map back.
 
-Movement keys become relative to where you are looking: up walks forward, left and right turn.
-
-It does not change raws or saves and does not need to be enabled for a world. The drawing is done by a native DFHack plugin (fpview) that has to be built for your DFHack version and placed in hack/plugins; see the README. Requires DFHack.]
+Requires DFHack, on Windows. The mod installs its DFHack plugin by itself the first time the game starts. Nothing is changed in your world or your saves.]
 [STEAM_TAG:dfhack]
 [STEAM_TAG:adventure]
 [STEAM_TAG:graphics]

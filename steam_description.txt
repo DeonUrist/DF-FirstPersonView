@@ -1,0 +1,104 @@
+[h1]First Person View[/h1]
+
+Play adventure mode through your adventurer's eyes. Press [b]Ctrl+Shift+F[/b] (or the camera button) and the map turns into a 3D world built from the game's own pictures: its walls, trees, furniture, items and creatures. Hills, pits, towers and tree tops are all there, and the rest of the game keeps working around it. Press it again to get the normal map back.
+
+Nothing is changed in your world or your saves, and you can switch the view on and off at any moment.
+
+[b]Needs DFHack, on Windows.[/b] Subscribe and start the game: the mod sets itself up at the title screen the first time.
+
+[h2]Controls[/h2]
+
+[b]Getting around[/b]
+[list]
+[*][b]Ctrl+Shift+F[/b] or the [b]camera button[/b]: switch between the first-person view and the normal map.
+[*][b]Mouse[/b]: look around. A crosshair stays in the middle of the screen.
+[*][b]Hold Alt[/b]: free the mouse pointer, to click the game's buttons and the mod's panels.
+[*][b]W / S[/b]: walk forward / back.
+[*][b]A / D[/b]: step left / right.
+[*][b]Shift+W / Shift+S[/b]: go up / down stairs.
+[*][b]C[/b]: lie down and crawl, or stand up again.
+[*][b]Arrow keys[/b]: do what W, A, S and D usually do in the game.
+[*][b]Mouse wheel[/b]: walk faster or slower (also your mount's pace while riding).
+[*][b]J[/b]: jump. Gold squares show every spot you can reach; click one to jump there.
+[/list]
+
+[b]Doing things[/b]
+[list]
+[*][b]Left click[/b]: do what your current [i]intent[/i] says with whatever is under the crosshair.
+[*][b]R[/b]: switch intent. Your choice shows on the crosshair:
+[list]
+[*][b]Info[/b]: see the game's description of a creature, item or building.
+[*][b]Interact[/b]: talk to someone, or pull a lever, use a well and so on.
+[*][b]Walk[/b]: walk to the spot you click.
+[*][b]Strike[/b], [b]Wrestle[/b]: attack a creature next to you.
+[*][b]Shoot[/b], [b]Throw[/b]: attack from a distance (Shoot only with a bow or crossbow in hand; it also nocks arrows and loads bolts).
+[/list]
+[*][b]Right click[/b]: the game's usual list of everything you can do on that spot.
+[*][b]Tab[/b]: open a ring of buttons around the pointer with all of the game's actions (search, climb, sneak, craft, travel, sleep...). You choose which actions are on it.
+[*][b]Space[/b]: let a moment pass. [b]Shift+Space[/b]: a longer one.
+[*][b]Timer button[/b]: let time run by itself, as slowly or quickly as you like (mouse wheel over it changes the speed). It stops by itself when something happens.
+[*][b]Esc[/b] or [b]right click[/b]: close any of the mod's menus.
+[/list]
+
+[b]Fighting[/b]
+[list]
+[*]Click a creature with [b]Strike[/b] and pick [b]Quick strike[/b] (hit at once) or [b]Aimed strike[/b]. When something is about to hit you, a [b]Dodge[/b] button appears too.
+[*]Aimed attacks show a [b]paperdoll[/b] of your target: click the body part to hit. Letters on each part tell you how easy it is to hit and how well the blow would land.
+[*]Shooting and throwing work the same way: click the target, then choose a quick or an aimed shot.
+[/list]
+
+[b]Panels[/b]
+[list]
+[*][b]I[/b]: your inventory, as a picture of your character with everything you wear and carry. Drag and drop to wear, hold, store, pick up or drop things.
+[*]The game's [b]journal key[/b]: the mod's journal, with a world map.
+[*][b]Gear button[/b] (next to the small map in the top right corner): the mod's settings.
+[/list]
+
+[h2]Features[/h2]
+
+[b]The world in 3D[/b]
+[list]
+[*]Everything is drawn with the game's own art, so it looks like your game, just seen from the ground.
+[*]Several levels at once: look up at rooftops and birds, or down into a pit.
+[*]Furniture, stairs, wells, statues, signs and battlements are proper 3D shapes.
+[*]Water at its real depth, ocean waves rolling onto the shore, snow, blood and mud on the ground, footprints when you show tracks.
+[*]The land goes on to the horizon: distant hills, mountains, forests and the sea, with snow when it has snowed.
+[*]A real sky: the sun moving through the day, the moon in its phase, stars at night, drifting clouds, fog, rain and snow, thunderstorms with lightning and thunder, and blood rain or evil clouds in their own colours.
+[*]Night and dark places are dark: what your adventurer can't see fades to black.
+[*]Smooth walking, turning and climbing.
+[/list]
+
+[b]Fighting[/b]
+[list]
+[*]One click starts an attack; the mod takes care of the game's menus for you.
+[*]Paperdoll aiming for strikes, shots and throws, with wounds marked on each body part.
+[*]Creatures you are fighting stand on a coloured circle that shows how serious the fight is.
+[*]Hits, misses and wounds float above creatures as they happen, and arrows show where blows come from.
+[*]A row of portraits of your enemies: click one to turn and face it.
+[*]Bows and crossbows: nock, load and unload with a click.
+[/list]
+
+[b]A new interface[/b]
+[list]
+[*]Your own paperdoll in the corner shows where you are hurt; point at a part to read what is wrong with it.
+[*]Bars for blood loss, exhaustion, pain, hunger, thirst and sleepiness, plus bars for stun, fever, drowning and other passing states.
+[*]A message log with icons, filters for combat, talk and other messages, and the date and your pace on top.
+[*]A compass that shows nearby places and the journal entries you are tracking.
+[*]A small top-down map that you can zoom.
+[*]The action ring replaces the game's rows of buttons, keeping the screen clear.
+[/list]
+
+[b]Inventory and journal[/b]
+[list]
+[*]A picture-based inventory with drag and drop, splitting and sharing out stacks, and strapping a pouch back on.
+[*]A journal that lists quests, rumours, sites, places, people, civilizations, regions, artifacts and creatures you know, with both their names, how far away they are and in which direction.
+[*]Track any entry to put it on the compass and the world map; tracked places show on the travel map too.
+[*]A world map tab drawn with the game's own map art.
+[/list]
+
+[b]Also[/b]
+[list]
+[*]Works in the object testing arena after "Assume Control" of a creature.
+[*]Most features can be turned off in the settings, and the field of view, draw distance and more can be changed.
+[*]All of the mod's own art (crosshairs, buttons, icons, paperdolls, sky, furniture shapes) is in its media folder for you to replace.
+[/list]

@@ -64,11 +64,9 @@ int click_inv_entry(const std::vector<df::adventure_optionst *> &list, int k, bo
         if (option_text(list[j], full) == text)
             ++skip;
     if (click_inv_row_text(text, skip)) {
-        mouse_log.push_back("inventory: clicked '" + text + "'");
         return 1;
     }
     if (tries >= 2) {
-        mouse_log.push_back("inventory: '" + text + "' not found on the game's page");
         return -1;
     }
     inv.scroll_position = inv_scroll_for(list.size(), tries == 0 ? k : k - 3);
@@ -109,7 +107,8 @@ int read_game_icons() {
                 const std::string name = option_text(io, false);
                 if (name.empty() || line.compare(0, name.size(), name) != 0)
                     continue;
-                inv_game_icon[io->item->id] = tex;
+                const auto pic = inv_grid.pictures.find(tex);
+                note_game_icon(io->item->id, name, tex, pic != inv_grid.pictures.end() ? pic->second : nullptr);
                 next = i + 1;
                 ++rows;
                 break;
@@ -119,14 +118,17 @@ int read_game_icons() {
     return rows;
 }
 
-// While some item of the list has no picture from the game yet, the unseen
-// list is paged through, a page a frame (never past its last page), and put
-// back where it was.
+// While some item of the list has no settled picture from the game yet, the
+// unseen list is paged through (never past its last page), each page kept up
+// until the pictures on it have held steady (note_game_icon), and put back
+// where it was.
 void collect_game_icons() {
     auto &inv = game->main_interface.adventure.inventory;
     using C = df::adventure_interface_inventory_context_type;
-    if (inv.context != C::MAIN || inv_drive.on || inv_press.on || inv_split.on)
+    // only from this frame's copy, whose pictures were taken with it
+    if (inv.context != C::MAIN || inv_drive.on || inv_press.on || inv_split.on || !grid_copied())
         return;
+    ++icon_frame;
     const int rows = read_game_icons();
     if (rows > 0)
         icon_page_rows = std::max(icon_page_rows, rows);
@@ -134,10 +136,25 @@ void collect_game_icons() {
     int missing = -1;
     for (size_t i = 0; i < list.size() && missing < 0; ++i) {
         auto *io = list[i] ? virtual_cast<df::adventure_option_inventory_itemst>(list[i]) : nullptr;
-        if (io && io->item && !inv_game_icon.count(io->item->id))
+        if (!io || !io->item)
+            continue;
+        const auto known = inv_game_icon.find(io->item->id);
+        if (known == inv_game_icon.end() || known->second.name != option_text(io, false) || !known->second.done)
             missing = int(i);
     }
     if (missing >= 0 && icon_page_rows > 0) {
+        auto *io = virtual_cast<df::adventure_option_inventory_itemst>(list[missing]);
+        const auto known = io ? inv_game_icon.find(io->item->id) : inv_game_icon.end();
+        // on this page and read this frame: its picture is still settling; the page stays
+        if (known != inv_game_icon.end() && known->second.seen == icon_frame &&
+            icon_ms() - known->second.cand_since < ICON_WAIT_MS)
+            return;
+        if (known != inv_game_icon.end() && known->second.seen == icon_frame) {
+            // kept changing for too long: what it shows now
+            known->second.img = known->second.cand;
+            known->second.done = true;
+            return;
+        }
         const int32_t to = inv_scroll_for(list.size(), missing);
         if (to > inv.scroll_position) {
             if (icon_page_from < 0)
@@ -146,10 +163,13 @@ void collect_game_icons() {
             return;
         }
     }
-    // one the game did not show where it was looked for: 0 marks it looked at
+    // one the game did not show where it was looked for: marked looked at, with no picture
     if (missing >= 0 && icon_page_rows > 0)
-        if (auto *io = virtual_cast<df::adventure_option_inventory_itemst>(list[missing]))
-            inv_game_icon[io->item->id] = 0;
+        if (auto *io = virtual_cast<df::adventure_option_inventory_itemst>(list[missing])) {
+            GameIcon &g = inv_game_icon[io->item->id];
+            g = GameIcon{option_text(io, false)};
+            g.done = true;
+        }
     if (icon_page_from >= 0) {
         inv.scroll_position = icon_page_from;
         icon_page_from = -1;
@@ -307,7 +327,6 @@ void apply_split(const InvSplit &w) {
         fresh->categorize(true);
         if (cont && Items::getContainer(fresh) != cont)
             Items::moveToContainer(fresh, cont);
-        mouse_log.push_back("inventory: split " + std::to_string(w.value) + " off item " + std::to_string(w.a));
         return;
     }
     df::item *b = df::item::find(w.b);
@@ -324,7 +343,6 @@ void apply_split(const InvSplit &w) {
         a->setStackSize(va);
         b->setStackSize(vb);
     }
-    mouse_log.push_back("inventory: shared " + std::to_string(va) + " / " + std::to_string(vb));
 }
 
 // The game straps a pouch (a container it does not count as wearable) over the
@@ -369,8 +387,6 @@ void apply_strap(df::unit *adv, const InvApply &a) {
         return;
     if (Items::moveToInventory(item, adv, df::inv_item_role_type::Flask, a.strap_bp)) {
         flash("Strapped to the " + a.strap_onto);
-        mouse_log.push_back("inventory: strapped item " + std::to_string(a.strap_item) + " to body part " +
-                            std::to_string(a.strap_bp));
     } else {
         flash("Could not strap it on");
     }
@@ -419,6 +435,21 @@ void inventory_grid_capture() {
     inv_grid.screen.assign(gps->screen, gps->screen + cells * 8);
     inv_grid.anchored.assign(gps->screentexpos_anchored, gps->screentexpos_anchored + cells);
     inv_grid.flag.assign(gps->screentexpos_flag, gps->screentexpos_flag + cells);
+    // the pictures, while their numbers still name what was drawn
+    inv_grid.pictures.clear();
+    for (size_t i = 0; i < cells; ++i) {
+        const long tex = inv_grid.anchored[i];
+        if (!tex || inv_grid.flag[i] != 0 || inv_grid.pictures.count(tex))
+            continue;
+        std::shared_ptr<fpv::Image> img;
+        uint32_t raw[fpv::TEXPIX];
+        if (fpv::TextureStore::readSprite(int32_t(tex), raw)) {
+            img = std::make_shared<fpv::Image>();
+            img->w = img->h = fpv::TEX;
+            img->px.assign(raw, raw + fpv::TEXPIX);
+        }
+        inv_grid.pictures[tex] = img;
+    }
     if (!ai.inventory.open)
         return;
     const auto lower = [&](int x, int y) {
@@ -606,7 +637,7 @@ void inv_drop(const InvModel &m, int32_t id, const InvBox &target) {
     if (it->ground) {
         // picked up first; then worn, or put in the container it was dropped on
         if (target.kind == INV_SLOT || target.kind == INV_SLOT_ITEM)
-            ground_get(id, m.slots[target.a].grasp ? 0 : WANT_WEAR, -1);
+            ground_get(id, m.slots[target.a].held ? 0 : WANT_WEAR, -1);
         else if (target.kind == INV_GROUP || target.kind == INV_ITEM)
             ground_get(id, m.groups[target.a].container >= 0 ? WANT_PUT : 0, m.groups[target.a].container);
         return;
@@ -615,8 +646,9 @@ void inv_drop(const InvModel &m, int32_t id, const InvBox &target) {
         const InvSlot &slot = m.slots[target.a];
         if (in(slot.items))
             return;
-        // into a hand: out of where it is (taken off, or out of its container)
-        if (slot.grasp) {
+        // into a hand's held square: out of where it is (taken off, or out of
+        // its container); its worn square is worn on, like any other part
+        if (slot.held) {
             if (it->flags & INV_CAN_REMOVE)
                 inv_request(INV_DO, id, WANT_REMOVE);
             else
@@ -756,7 +788,6 @@ void inventory_drive() {
     auto &inv = game->main_interface.adventure.inventory;
     using C = df::adventure_interface_inventory_context_type;
     if (++d.frames > 90) {
-        mouse_log.push_back("inventory: gave up at stage " + std::to_string(d.stage));
         d.on = false;
         return;
     }
@@ -920,7 +951,6 @@ void inventory_drive() {
                     std::set<df::interface_key> keys{df::interface_key::SELECT};
                     INTERPOSE_NEXT(feed)(&keys);
                 }
-                mouse_log.push_back("inventory: picked up " + std::to_string(ol.number_amount));
             } else {
                 inv_then = InvThen();
                 leave();
@@ -964,7 +994,6 @@ void inventory_drive() {
             if (option_text(ol.option[j], true) == text)
                 ++skip;
         if (click_inv_row_text(text, skip)) {
-            mouse_log.push_back("inventory: picked up with '" + text + "'");
             d.stage = 2;
             d.tries = 0;
             d.wait = 1;
@@ -1064,13 +1093,11 @@ void inventory_logic() {
         return;
     }
     if (now_ms() > inv_reopen_until) {
-        mouse_log.push_back("inventory: reopen: gave up after 20 s");
         inv_reopen_until = 0;
         return;
     }
     const std::string other = other_window();
     if (!other.empty()) {
-        mouse_log.push_back("inventory: reopen: not over " + other);
         inv_reopen_until = 0;
         return;
     }
@@ -1079,8 +1106,6 @@ void inventory_logic() {
         INTERPOSE_NEXT(feed)(&keys);
         inv_reopen_tried = std::max<uint32_t>(1, inv_render_frame);
         const std::vector<std::string> focus = Gui::getCurFocus(true);
-        mouse_log.push_back("inventory: reopen: key sent (" + (focus.empty() ? std::string() : focus[0]) + ")" +
-                            (game->main_interface.adventure.inventory.open ? " open" : " still closed"));
     }
 }
 
@@ -1105,9 +1130,6 @@ void inventory_frame() {
         inv_drag = -1;
         return;
     }
-    if (!want && !hold && inv_up && inv_reopen_until)
-        mouse_log.push_back(std::string("inventory: panel gone while reopening: ") +
-                            (!usable ? "panel not usable here" : other_window().empty() ? "time" : other_window()));
     if (!want && !hold) {
         if (inv_up) {
             inv_up = false;

@@ -528,6 +528,7 @@ struct Builder {
     float inv_view, max_d;
     uint8_t fog_a[1025];   // how much haze lies over something, by its distance as a fraction of the fog distance
     SDL_Color fogc;
+    const SightMap *sight = nullptr;   // light by what the adventurer sees, or none
     Pick hl;
     int zlo = 0, zhi = -1, nz = 0;
     std::vector<const Cell *> cells;   // per level, null if not captured
@@ -571,6 +572,7 @@ struct Builder {
         }
         max_d = view_dist + 4;
         fogc = SDL_Color{Uint8(px_r(opt.fog)), Uint8(px_g(opt.fog)), Uint8(px_b(opt.fog)), 255};
+        sight = opt.sight && scene.sight.on ? &scene.sight : nullptr;
         hl = opt.highlight;
     }
 
@@ -579,6 +581,19 @@ struct Builder {
         o.x = dx * rx + dy * ry;
         o.y = dx * ux + dy * uy + dz * uz;
         o.z = dx * fx + dy * fy + dz * fz;
+    }
+
+    // the light at a point given in the camera's space (Scene::sight), 0..255
+    inline int light(const VV &p) const {
+        if (!sight)
+            return 255;
+        const float wx = px + p.x * rx + p.y * ux + p.z * fx;
+        const float wy = py + p.x * ry + p.y * uy + p.z * fy;
+        const float wz = pe + p.y * uz + p.z * fz;
+        return std::clamp(int(sight->at(wx, wy, wz) * 255.0f + 0.5f), 0, 255);
+    }
+    static inline SDL_Color dim(SDL_Color c, int k) {
+        return SDL_Color{Uint8(c.r * k / 255), Uint8(c.g * k / 255), Uint8(c.b * k / 255), c.a};
     }
 
     inline void fan(int base, int n) {
@@ -592,7 +607,7 @@ struct Builder {
     // a polygon wholly in front of the eye: onto the screen
     void emit(const VV *p, int n, const Mat &m, int passes, bool expand) {
         float sx[12], sy[12];
-        uint8_t fa[12];
+        uint8_t fa[12], lk[12];
         float minx = 1e30f, maxx = -1e30f, miny = 1e30f, maxy = -1e30f;
         int amin = 255, amax = 0;
         for (int i = 0; i < n; ++i) {
@@ -611,6 +626,7 @@ struct Builder {
             const int shaded = 255 - (255 - a) * m.shade / 255;
             fa[i] = uint8_t(shaded);
             amax = std::max(amax, shaded);
+            lk[i] = uint8_t(light(p[i]));
         }
         if (maxx < 0 || minx > W || maxy < 0 || miny > H)
             return;
@@ -687,7 +703,7 @@ struct Builder {
                         v.position.y += ey / len * 0.7f;
                     }
                 }
-                v.color = col;
+                v.color = sight ? SDL_Color{lk[i], lk[i], lk[i], 255} : col;
                 v.tex_coord.x = (pic.x + p[i].s * pic.w) * g.inv;
                 v.tex_coord.y = (pic.y + p[i].t * pic.h) * g.inv;
                 V.push_back(v);
@@ -700,7 +716,7 @@ struct Builder {
                 SDL_Vertex v;
                 v.position.x = sx[i];
                 v.position.y = sy[i];
-                v.color = fogc;
+                v.color = sight ? dim(fogc, lk[i]) : fogc;
                 v.color.a = hazed ? Uint8(255) : fa[i];
                 v.tex_coord.x = (sil.x + p[i].s * sil.w) * g.inv;
                 v.tex_coord.y = (sil.y + p[i].t * sil.h) * g.inv;
@@ -1349,6 +1365,8 @@ struct Builder {
             }
             SDL_Color col = dc.col;
             col.a = d.alpha;
+            if (sight)
+                col = dim(col, light(v[0]));
             plain(v, n, col);
         }
     }
@@ -1826,7 +1844,10 @@ struct Builder {
                 const int l = std::min(255, int(x * shade + 0.5f));
                 return Uint8((l * (255 - haze) + fog * haze + 127) / 255);
             };
-            return SDL_Color{ch(px_r(c), fogc.r), ch(px_g(c), fogc.g), ch(px_b(c), fogc.b), 255};
+            const SDL_Color out{ch(px_r(c), fogc.r), ch(px_g(c), fogc.g), ch(px_b(c), fogc.b), 255};
+            return sight ? dim(out, int(sight->column(px + p.x * rx + p.y * ux + p.z * fx,
+                                                       py + p.x * ry + p.y * uy + p.z * fy) * 255.0f + 0.5f))
+                         : out;
         };
         SDL_Color c[4];
         for (int q = 0; q < 4; ++q)
