@@ -81,6 +81,12 @@ local function view_shown()
     return _G.fpview_view_shown == true
 end
 
+-- one of the game's windows reaches into the corner of the minimap (naming an item):
+-- the minimap is off for that while, and its buttons and the gear stay off it too
+local function corner_covered()
+    return _G.fpview_corner_covered == true
+end
+
 local function realtime_on()
     return _G.fpview_realtime_on == true
 end
@@ -274,9 +280,10 @@ end
 -- columns 36 to about 45 (measured on a screenshot of the game). Ours take
 -- 4 x 3 cells (32 x 36 pixels): the camera in the next slot, column 16
 -- (x=17), the timer after it (columns 20 to 26). While the view shows, the
--- plugin moves the game's lower row and the speed display up beside the timer
--- (columns 27 to 60) and the action bar down right of the portrait; the
--- travel and sleep buttons follow the speed display, from column 61.
+-- plugin moves the game's lower row up beside the timer (columns 27 to 50),
+-- takes the speed display off the screen (what it says is in the message
+-- list) and moves the action bar down right of the portrait; the travel and
+-- sleep buttons follow the game's row, from column 51.
 --
 -- Each widget class is made anew (defclass(nil, ...)) every time this file is
 -- loaded. DFHack keeps a script's globals when the file is reloaded, and
@@ -296,6 +303,68 @@ CameraButton.ATTRS{
     version=7,
 }
 
+-- DFHack's logo button would lie over the paperdoll and its bars. While the
+-- view is on it goes to the top right corner, at the top of the column of the
+-- minimap's buttons (or over the lone gear without the minimap); when the view
+-- goes off it goes back to where DFHack's overlay settings put it. Only the
+-- widget's place on the screen is changed, not those settings.
+local LOGO_WIDGET = 'hotkeys.adventuremenu'
+logo_moved = logo_moved or false
+
+local function frame_at(pos, old)
+    local frame = {w=old.w, h=old.h}
+    if pos.x < 0 then frame.r = -pos.x - 1 else frame.l = pos.x - 1 end
+    if pos.y < 0 then frame.b = -pos.y - 1 else frame.t = pos.y - 1 end
+    return frame
+end
+
+local function place_dfhack_logo()
+    local ok, state = pcall(overlay.get_state)
+    local entry = ok and state.db[LOGO_WIDGET]
+    if not entry or not entry.widget then return end
+    local w = entry.widget
+    if view_shown() then
+        local frame = frame_at({x=(minimap_shown() or corner_covered()) and -30 or -1, y=1}, w.frame)
+        if not logo_moved or w.frame.r ~= frame.r or w.frame.t ~= frame.t then
+            w.frame = frame
+            w:updateLayout()
+            logo_moved = true
+        end
+    elseif logo_moved then
+        local config = state.config[LOGO_WIDGET]
+        local pos = config and config.pos or w.default_pos
+        w.frame = frame_at(pos, w.frame)
+        w:updateLayout()
+        logo_moved = false
+    end
+end
+
+-- With the ring (Tab) the camera and the timer are on it, at its top: the
+-- buttons are only shown while the first-person view is off (the camera turns
+-- it on).
+local function on_ring()
+    return view_shown() and config.get('radial_menu')
+end
+
+-- the timer's number set with the wheel over the ring's timer: kept in the settings
+local function store_ring_rate()
+    local rate = _G.fpview_realtime_rate
+    if type(rate) ~= 'number' then return end
+    _G.fpview_realtime_rate = nil
+    if rate ~= config.get('realtime_rate') then
+        config.set('realtime_rate', rate)
+    end
+end
+
+-- the travel map: the button has no use there and is not shown
+local function traveling()
+    local ok, yes = pcall(function()
+        local adv = df.global.adventure
+        return adv ~= nil and adv.menu == df.ui_advmode_menu.Travel
+    end)
+    return ok and yes
+end
+
 function CameraButton:onRenderBody(dc)
     paint_button(dc, 'button_camera', 4, 3, false, self:getMousePos() ~= nil, camera_chars)
 end
@@ -304,6 +373,12 @@ end
 -- widget in the same spot (Herald's alert) may take the click before it gets
 -- here, and the button would do nothing.
 function CameraButton:render(dc)
+    place_dfhack_logo()
+    store_ring_rate()
+    if traveling() or on_ring() then
+        self.was_down = df.global.enabler.mouse_lbut_down ~= 0
+        return
+    end
     local down = df.global.enabler.mouse_lbut_down ~= 0
     if down and not self.was_down and self:getMousePos() then
         dfhack.run_command('first-person', 'toggle')
@@ -314,6 +389,7 @@ end
 
 function CameraButton:onInput(keys)
     -- a click on the button is ours and goes no further
+    if traveling() or on_ring() then return false end
     if keys._MOUSE_L and self:getMousePos() then
         return true
     end
@@ -355,7 +431,8 @@ TimeButton.ATTRS{
     viewscreens='dungeonmode',
     frame={w=7, h=3},
     version=2,
-    visible=view_shown,
+    -- with the ring the timer is on it
+    visible=function() return view_shown() and not config.get('radial_menu') end,
 }
 
 function TimeButton:onRenderBody(dc)
@@ -403,13 +480,14 @@ end
 -- the corner holds the message list.
 TravelSleepButtons = defclass(nil, overlay.OverlayWidget)
 TravelSleepButtons.ATTRS{
-    desc='Adds travel (map) and sleep buttons right of the speed display while the first-person view is shown.',
+    desc='Adds travel (map) and sleep buttons right of the game\'s row of buttons while the first-person view is shown.',
     default_enabled=true,
-    default_pos={x=62, y=-4},
+    default_pos={x=52, y=-4},
     viewscreens='dungeonmode',
     frame={w=8, h=3},
-    version=2,
-    visible=view_shown,
+    version=3,
+    -- with the ring (Tab) travel and sleep are on it, and the bottom has no buttons
+    visible=function() return view_shown() and not config.get('radial_menu') end,
 }
 
 -- Paints the game's own 4 x 3 button picture that starts at tile col, row of
@@ -436,6 +514,16 @@ end
 -- characters) only if the game has none
 function TravelSleepButtons:onRenderBody(dc)
     local x = self:getMousePos()
+    -- the plugin draws the button's caption over everything (paint_widget_hint):
+    -- 1 travel, 2 sleep, and that button's top left cell
+    local body = self.frame_body
+    if x and body then
+        _G.fpview_widget_hint = x < 4 and 1 or 2
+        _G.fpview_widget_hint_x = body.x1 + (x < 4 and 0 or 4)
+        _G.fpview_widget_hint_y = body.y1
+    else
+        _G.fpview_widget_hint = 0
+    end
     local travel, sleep = dc:viewport(0, 0, 4, 3), dc:viewport(4, 0, 4, 3)
     if not paint_game_button(travel, 20, 3) then
         paint_button(travel, 'button_travel', 4, 3, false, x ~= nil and x < 4, map_chars)
@@ -471,25 +559,26 @@ end
 
 -- (the message list in the bottom right corner is drawn by the plugin)
 
--- next to the minimap, top to bottom: "@" draws it in text characters and
+-- next to the minimap, top to bottom, under the DFHack logo (place_dfhack_logo):
+-- the gear opens the settings, "@" draws the minimap in text characters and
 -- back, "+" and "-" zoom it
 MinimapButtons = defclass(nil, overlay.OverlayWidget)
 MinimapButtons.ATTRS{
-    desc='Adds buttons next to the first-person minimap: @ switches it between graphics and text characters, + and - zoom it, the gear opens the settings.',
+    desc='Adds buttons next to the first-person minimap: the gear opens the settings, @ switches it between graphics and text characters, + and - zoom it.',
     default_enabled=true,
-    default_pos={x=-30, y=3},
+    default_pos={x=-30, y=4},
     viewscreens='dungeonmode',
     frame={w=4, h=12},
-    version=4,
+    version=6,
     visible=minimap_shown,
 }
 
 function MinimapButtons:init()
     self:addviews{
-        framed_icon('ascii', 0, 'icon_ascii', '@'),
-        framed_icon('zoom_in', 3, 'icon_zoom_in', '+'),
-        framed_icon('zoom_out', 6, 'icon_zoom_out', '-'),
-        framed_icon('settings', 9, 'icon_settings', string.char(15)),
+        framed_icon('settings', 0, 'icon_settings', string.char(15)),
+        framed_icon('ascii', 3, 'icon_ascii', '@'),
+        framed_icon('zoom_in', 6, 'icon_zoom_in', '+'),
+        framed_icon('zoom_out', 9, 'icon_zoom_out', '-'),
     }
 end
 
@@ -499,27 +588,135 @@ SettingsScreen.ATTRS{
     focus_path='first-person/settings',
 }
 
+-- the field of view slider: a stop every 10 degrees
+local FOV_MIN, FOV_STEP = config.SCHEMA.fov.min, 10
+local FOV_STOPS = (config.SCHEMA.fov.max - FOV_MIN) // FOV_STEP + 1
+
+local function set_from_screen(key, value)
+    dfhack.run_command_silent('first-person', 'set', key, tostring(value))
+end
+
+-- A number setting typed in: its hotkey (or a click) starts typing, Enter
+-- applies, Esc gives up. While typing it takes every key, so digits do not
+-- reach the window's other hotkeys. Not typing, it shows the stored value.
+NumberField = defclass(nil, widgets.EditField)
+NumberField.ATTRS{
+    setting=DEFAULT_NIL,
+    modal=true,
+}
+
+function NumberField:init()
+    local spec = config.SCHEMA[self.setting]
+    self.on_char = function(ch, text) return ch:find('%d') ~= nil and #text < #tostring(spec.max) end
+    self.text_area.on_char = self.on_char
+    self.text_area.on_submit = function(text)
+        local n = tonumber(text)
+        if n then
+            set_from_screen(self.setting, math.max(spec.min, math.min(spec.max, math.floor(n))))
+        end
+        self:setText(tostring(config.get(self.setting)))
+    end
+    self:setText(tostring(config.get(self.setting)))
+end
+
+-- typing replaces the value instead of adding to it
+function NumberField:setFocus(focus)
+    if focus and not self.focus then self:setText('') end
+    return NumberField.super.setFocus(self, focus)
+end
+
+function NumberField:render(dc)
+    if not self.focus then
+        local stored = tostring(config.get(self.setting))
+        if self.text ~= stored then self:setText(stored) end
+    end
+    NumberField.super.render(self, dc)
+end
+
+-- Weather to test with, in the plugin's order (WEATHER_NAMES in fpview.cpp).
+-- The first is the game's own. Not stored: every game starts with the real weather.
+local WEATHER_NAMES = {'None (real weather)', 'Clear', 'Cumulus', 'Many cumulus', 'Cirrus', 'Altostratus',
+    'Overcast', 'Mist', 'Fog', 'Thick fog', 'Rain', 'Storm', 'Snow', 'Blood rain', 'Evil cloud'}
+weather_pick = weather_pick or 1
+
 function SettingsScreen:init()
+    local function toggle(key, row, hotkey, label)
+        return widgets.ToggleHotkeyLabel{
+            view_id=key,
+            frame={t=row, l=0},
+            key=hotkey,
+            label=label,
+            initial_option=config.get(key),
+            on_change=function(on)
+                set_from_screen(key, on)
+                -- the markers go off with the compass
+                if key == 'compass' and not on then
+                    self.subviews.compass_markers:setOption(false)
+                end
+            end,
+        }
+    end
+    local function number(key, row, hotkey, label)
+        local spec = config.SCHEMA[key]
+        return NumberField{
+            view_id=key,
+            frame={t=row, l=0, w=48},
+            key=hotkey,
+            label_text=('%s (%d-%d): '):format(label, spec.min, spec.max),
+            setting=key,
+        }
+    end
+    local markers = toggle('compass_markers', 3, 'CUSTOM_M', 'Compass markers')
+    markers.enabled = function() return config.get('compass') end
     self:addviews{
         widgets.Window{
-            frame={w=56, h=9},
+            frame={w=56, h=25},
             frame_title='First Person View settings',
             subviews={
-                widgets.ToggleHotkeyLabel{
-                    view_id='new_renderer',
-                    frame={t=0, l=0},
-                    key='CUSTOM_N',
-                    label='New renderer',
-                    initial_option=config.get('new_renderer'),
-                    on_change=function(on)
-                        dfhack.run_command_silent('first-person', 'set', 'new_renderer', tostring(on))
+                toggle('hardware_renderer', 0, 'CUSTOM_H', 'Hardware renderer'),
+                toggle('cursor_hint', 1, 'CUSTOM_C', 'Cursor hint'),
+                toggle('compass', 2, 'CUSTOM_O', 'Compass'),
+                markers,
+                toggle('minimap', 4, 'CUSTOM_I', 'Minimap'),
+                toggle('enemy_list', 5, 'CUSTOM_E', 'Enemy list'),
+                toggle('auto_attack', 6, 'CUSTOM_A', 'Auto attack'),
+                toggle('far_land', 7, 'CUSTOM_L', 'Far land'),
+                number('view_distance', 9, 'CUSTOM_D', 'Draw distance, tiles'),
+                number('max_height', 10, 'CUSTOM_U', 'Maximum height, levels'),
+                number('max_depth', 11, 'CUSTOM_N', 'Maximum depth, levels'),
+                number('horizon', 12, 'CUSTOM_Z', 'Horizon, tiles'),
+                number('far_trees', 13, 'CUSTOM_T', 'Far trees, tiles'),
+                widgets.Label{
+                    frame={t=14, l=2},
+                    text='Type a number, Enter to apply, Esc to cancel',
+                    text_pen=COLOR_GREY,
+                },
+                widgets.Label{
+                    frame={t=16, l=0},
+                    text={'FOV: ', {text=function() return tostring(config.get('fov')) end, pen=COLOR_YELLOW}},
+                },
+                widgets.Slider{
+                    frame={t=17, l=0, w=3 * (FOV_STOPS - 1) + 7},
+                    num_stops=FOV_STOPS,
+                    get_idx_fn=function()
+                        return (config.get('fov') - FOV_MIN + FOV_STEP // 2) // FOV_STEP + 1
+                    end,
+                    on_change=function(idx)
+                        set_from_screen('fov', FOV_MIN + (idx - 1) * FOV_STEP)
                     end,
                 },
-                widgets.WrappedLabel{
-                    frame={t=2, l=0},
-                    text_to_wrap='Draws the view on the graphics card: look straight up or down without '
-                        .. 'the picture stretching. Off: the software renderer.',
-                    text_pen=COLOR_GREY,
+                widgets.Label{
+                    frame={t=19, l=0},
+                    text={'Weather (debug): ', {text=function() return WEATHER_NAMES[weather_pick] end, pen=COLOR_YELLOW}},
+                },
+                widgets.Slider{
+                    frame={t=20, l=0, w=3 * (#WEATHER_NAMES - 1) + 7},
+                    num_stops=#WEATHER_NAMES,
+                    get_idx_fn=function() return weather_pick end,
+                    on_change=function(idx)
+                        weather_pick = idx
+                        dfhack.run_command_silent(config.PLUGIN, 'set', 'debug_weather', tostring(idx - 1))
+                    end,
                 },
             },
         },
@@ -554,8 +751,33 @@ function MinimapButtons:onInput(keys)
     return MinimapButtons.super.onInput(self, keys)
 end
 
+-- Without the minimap its buttons go too; the gear alone stays, in the top
+-- right corner under the DFHack logo, so the settings (and the minimap) can be reached.
+SettingsButton = defclass(nil, overlay.OverlayWidget)
+SettingsButton.ATTRS{
+    desc='Adds the gear that opens the first-person settings in the top right corner while the minimap is off.',
+    default_enabled=true,
+    default_pos={x=-1, y=4},
+    viewscreens='dungeonmode',
+    frame={w=4, h=3},
+    version=2,
+    visible=function() return view_shown() and not minimap_shown() and not corner_covered() end,
+}
+
+function SettingsButton:init()
+    self:addviews{framed_icon('settings', 0, 'icon_settings', string.char(15))}
+end
+
+function SettingsButton:onInput(keys)
+    if keys._MOUSE_L and on_button(self.subviews.settings) then
+        SettingsScreen{}:show()
+        return true
+    end
+    return SettingsButton.super.onInput(self, keys)
+end
+
 OVERLAY_WIDGETS = {button=CameraButton, timer=TimeButton, travel_sleep=TravelSleepButtons,
-    minimap_style=MinimapButtons}
+    minimap_style=MinimapButtons, settings=SettingsButton}
 
 ---------------------------------------------------------------------------
 -- talking to the plugin
@@ -664,6 +886,10 @@ local function set_setting(key, value)
     end
     if config.SCHEMA[key].plugin then
         plugin('set', key, tostring(config.get(key)))
+    end
+    -- no compass, no markers on it
+    if key == 'compass' and not config.get('compass') and config.get('compass_markers') then
+        set_setting('compass_markers', false)
     end
     print(('%s = %s'):format(key, tostring(config.get(key))))
 end

@@ -12,6 +12,7 @@ constexpr int TEXPIX = TEX * TEX;
 constexpr float LEVEL_H = 1.2f;      // height of one z-level, in tile widths
 constexpr float EYE = 0.52f;         // eye height above the floor, in tile widths
 constexpr float EYE_PRONE = 0.14f;   // ... while lying on the ground
+constexpr float EYE_RIDING = 0.37f;  // raised by this much while riding: a table top (media/models/table.obj)
 constexpr float THING_SCALE = 0.7f;  // size of a 32 pixel sprite, in tile widths
 
 // pixels are 0xAABBGGRR (SDL_PIXELFORMAT_RGBA32 on little-endian), the layout

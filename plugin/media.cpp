@@ -15,6 +15,23 @@ namespace fpv {
 
 namespace {
 
+#include "vital_icons.inc"
+
+static_assert(sizeof(VITAL_ICON_ROWS) / sizeof(VITAL_ICON_ROWS[0]) == VITAL_ICONS);
+
+// a built-in icon drawn from its rows
+Image vital_icon_builtin(int i) {
+    Image img;
+    img.w = img.h = 12;
+    img.px.assign(12 * 12, 0);
+    for (int y = 0; y < 12; ++y)
+        for (int x = 0; x < 12 && VITAL_ICON_ROWS[i].rows[y][x]; ++x)
+            for (const VitalIconColour &c : VITAL_ICON_COLOURS)
+                if (c.key == VITAL_ICON_ROWS[i].rows[y][x])
+                    img.px[size_t(y) * 12 + x] = rgb(c.r, c.g, c.b);
+    return img;
+}
+
 std::string trim(const std::string &s) {
     const size_t a = s.find_first_not_of(" \t\r\n");
     if (a == std::string::npos)
@@ -29,6 +46,8 @@ std::string lower(std::string s) {
             c = char(c - 'A' + 'a');
     return s;
 }
+
+} // namespace
 
 bool load_png(const std::string &path, Image &out) {
     std::error_code ec;
@@ -54,6 +73,8 @@ bool load_png(const std::string &path, Image &out) {
     DFHack::DFSDL::DFSDL_FreeSurface(surf);
     return good;
 }
+
+namespace {
 
 void load_slots(const std::string &path, Doll &doll) {
     std::ifstream in(path);
@@ -99,6 +120,11 @@ std::shared_ptr<const Media> load_media(const std::string &dir) {
     one("aim_shoot.png", m->aim[AIM_SHOOT]);
     one("aim_throw.png", m->aim[AIM_THROW]);
     one("aim_wrestle.png", m->aim[AIM_WRESTLE]);
+    one("aim_nock.png", m->aim[AIM_NOCK]);
+    one("aim_unnock.png", m->aim[AIM_UNNOCK]);
+    one("aim_info.png", m->aim[AIM_INFO]);
+    one("aim_interact.png", m->aim[AIM_INTERACT]);
+    one("aim_walk.png", m->aim[AIM_WALK]);
     one("checkbox_on.png", m->checkbox_on);
     one("checkbox_off.png", m->checkbox_off);
     one("compass.png", m->compass);
@@ -110,6 +136,35 @@ std::shared_ptr<const Media> load_media(const std::string &dir) {
     one("msg_other.png", m->msg_icon[2]);
     one("msg_hide.png", m->msg_icon[3]);
     one("msg_show.png", m->msg_icon[4]);
+    one("minimap_arrow.png", m->minimap_arrow);
+    one("compass_places.png", m->compass_places);
+    one("struck_hit.png", m->struck_hit);
+    one("struck_miss.png", m->struck_miss);
+    one("shot_quick.png", m->shot[0]);
+    one("shot_aimed.png", m->shot[1]);
+    one("throw_quick.png", m->shot[2]);
+    one("throw_aimed.png", m->shot[3]);
+    one("strike_quick.png", m->shot[4]);
+    one("strike_aimed.png", m->shot[5]);
+    one("dodge.png", m->shot[6]);
+    one("button_camera.png", m->button_camera);
+    one("sky/sun.png", m->sun);
+    for (int i = 0; i < MOON_PHASES; ++i)
+        one(("sky/moon_" + std::to_string(i) + ".png").c_str(), m->moon[i]);
+    one("sky/stars.png", m->stars);
+    one("sky/clouds_cirrus.png", m->clouds[CLOUD_CIRRUS]);
+    one("sky/clouds_cumulus.png", m->clouds[CLOUD_CUMULUS]);
+    one("sky/clouds_cumulus_many.png", m->clouds[CLOUD_CUMULUS_MANY]);
+    one("sky/clouds_nimbus.png", m->clouds[CLOUD_NIMBUS]);
+    one("sky/clouds_altostratus.png", m->clouds[CLOUD_ALTOSTRATUS]);
+    one("sky/clouds_stratus.png", m->clouds[CLOUD_STRATUS]);
+    one("sky/rain.png", m->rain);
+    one("sky/snow.png", m->snow);
+    for (int i = 0; i < VITAL_ICONS; ++i) {
+        one((std::string("vitals/") + VITAL_ICON_ROWS[i].name + ".png").c_str(), m->vital_icon[i]);
+        if (!m->vital_icon[i].ok())
+            m->vital_icon[i] = vital_icon_builtin(i);
+    }
 
     std::error_code ec;
     std::vector<std::string> names;
@@ -229,6 +284,48 @@ void Canvas::text(const Font &font, int x, int y, const std::string &s, uint32_t
                 const int dx = ox + xx;
                 if (dx >= 0 && dx < w && (bits >> (xx * 8 / cw)) & 1)
                     px[size_t(dy) * w + dx] = color;
+            }
+        }
+    }
+}
+
+void Canvas::text(const GlyphFont &font, int x, int y, const std::string &s, uint32_t color, int cw, int ch) {
+    if (cw < 1 || ch < 1 || !font.ok())
+        return;
+    const uint32_t cr = px_r(color), cg = px_g(color), cb = px_b(color);
+    for (size_t i = 0; i < s.size(); ++i) {
+        const std::vector<uint32_t> &g = font.glyph[uint8_t(s[i])];
+        const int ox = x + int(i) * cw;
+        if (ox >= w)
+            break;
+        if (g.size() != size_t(font.w) * font.h)
+            continue;
+        for (int yy = 0; yy < ch; ++yy) {
+            const int dy = y + yy;
+            if (dy < 0 || dy >= h)
+                continue;
+            // each pixel from the glyph pixel under its centre, as the game's
+            // renderer does when it stretches the font into its cells
+            const uint32_t *src = g.data() + size_t((2 * yy + 1) * font.h / (2 * ch)) * font.w;
+            for (int xx = 0; xx < cw; ++xx) {
+                const int dx = ox + xx;
+                if (dx < 0 || dx >= w)
+                    continue;
+                const uint32_t s0 = src[(2 * xx + 1) * font.w / (2 * cw)];
+                const uint32_t a = px_a(s0);
+                if (!a)
+                    continue;
+                const uint32_t r = px_r(s0) * cr / 255, gg = px_g(s0) * cg / 255, b = px_b(s0) * cb / 255;
+                uint32_t &d = px[size_t(dy) * w + dx];
+                // "over": the glyph on top of what the canvas holds, alpha included
+                const uint32_t da = px_a(d);
+                const uint32_t oa = a + da * (255 - a) / 255;
+                if (!oa)
+                    continue;
+                const auto mix = [&](uint32_t sc, uint32_t dc) {
+                    return (sc * a + dc * da * (255 - a) / 255) / oa;
+                };
+                d = (oa << 24) | (mix(b, px_b(d)) << 16) | (mix(gg, px_g(d)) << 8) | mix(r, px_r(d));
             }
         }
     }

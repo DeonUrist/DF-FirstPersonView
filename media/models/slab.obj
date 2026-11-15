@@ -1,0 +1,20 @@
+# Slab: an upright stone with the game's drawing of it on both flat sides.
+# (how a model is laid out: README.txt)
+mtllib models.mtl
+o Slab
+v -0.280000 0.000000 -0.060000
+v 0.280000 0.000000 -0.060000
+v 0.280000 0.000000 0.060000
+v -0.280000 0.000000 0.060000
+v -0.280000 0.560000 -0.060000
+v 0.280000 0.560000 -0.060000
+v 0.280000 0.560000 0.060000
+v -0.280000 0.560000 0.060000
+usemtl own
+f 1 2 3 4
+f 8 7 6 5
+f 6 7 3 2
+f 8 5 1 4
+usemtl picture
+f 5 6 2 1
+f 7 8 4 3

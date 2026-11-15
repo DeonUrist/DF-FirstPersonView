@@ -5,6 +5,7 @@
 
 #include "modules/Maps.h"
 #include "modules/Materials.h"
+#include "TileTypes.h"
 
 #include "df/block_square_event.h"
 #include "df/block_square_event_item_spatterst.h"
@@ -161,57 +162,202 @@ Spatters::Kind Spatters::kindOf(uint64_t key, int16_t mat_type, int32_t mat_inde
     return k;
 }
 
-Spatters::Top Spatters::top(int x, int y, int z) {
-    Top best;
+int Spatters::kinds(int x, int y, int z, Top *out, int max) {
     const df::map_block *block = Maps::getTileBlock(x, y, z);
     if (!block)
-        return best;
+        return 0;
+    int n = 0;
     const int bx = x & 15, by = y & 15;
+    const auto add = [&](uint64_t key, int amount, auto kind_of) {
+        if (amount <= 0)
+            return;
+        const Kind k = kind_of();
+        for (int i = 0; i < n; ++i)
+            if (out[i].kind == k) {
+                if (amount > out[i].amount) {
+                    out[i].amount = amount;
+                    out[i].key = key;
+                }
+                return;
+            }
+        if (n < max)
+            out[n++] = Top{key, amount, 0, k};
+    };
     for (df::block_square_event *ev : block->block_events) {
         if (auto *m = virtual_cast<df::block_square_event_material_spatterst>(ev)) {
-            const int a = m->amount[bx][by];
-            if (a > best.amount) {
-                best.amount = a;
-                best.key = (1ull << 63) | (uint64_t(uint8_t(m->mat_state)) << 48) |
-                           (uint64_t(uint16_t(m->mat_type)) << 32) | uint32_t(m->mat_index);
-                best.kind = kindOf(best.key, m->mat_type, m->mat_index, int(m->mat_state), -1, -1);
-            }
+            const uint64_t key = (1ull << 63) | (uint64_t(uint8_t(m->mat_state)) << 48) |
+                                 (uint64_t(uint16_t(m->mat_type)) << 32) | uint32_t(m->mat_index);
+            add(key, m->amount[bx][by],
+                [&] { return kindOf(key, m->mat_type, m->mat_index, int(m->mat_state), -1, -1); });
         } else if (auto *it = virtual_cast<df::block_square_event_item_spatterst>(ev)) {
-            const int a = it->amount[bx][by];
-            if (a > best.amount) {
-                best.amount = a;
-                best.key = (1ull << 62) | (uint64_t(uint8_t(it->item_type)) << 48) |
-                           (uint64_t(uint16_t(it->item_subtype)) << 32) | uint32_t(it->matindex);
-                best.kind = kindOf(best.key, it->mattype, it->matindex, -1, int(it->item_type), it->item_subtype);
-            }
+            const uint64_t key = (1ull << 62) | (uint64_t(uint8_t(it->item_type)) << 48) |
+                                 (uint64_t(uint16_t(it->item_subtype)) << 32) | uint32_t(it->matindex);
+            add(key, it->amount[bx][by],
+                [&] { return kindOf(key, it->mattype, it->matindex, -1, int(it->item_type), it->item_subtype); });
         }
     }
-    best.level = level_of(best.amount);
+    for (int i = 0; i < n; ++i)
+        out[i].level = level_of(out[i].amount);
+    return n;
+}
+
+Spatters::Top Spatters::top(int x, int y, int z) {
+    Top all[16];
+    const int n = kinds(x, y, z, all, 16);
+    Top best;
+    for (int i = 0; i < n; ++i)
+        if (all[i].amount > best.amount)
+            best = all[i];
     return best;
+}
+
+int Spatters::levelOf(int x, int y, int z, Kind kind) {
+    Top all[16];
+    const int n = kinds(x, y, z, all, 16);
+    for (int i = 0; i < n; ++i)
+        if (all[i].kind == kind)
+            return all[i].level;
+    return 0;
+}
+
+int Spatters::levelBeside(int x, int y, int z, Kind kind, bool from_slope) {
+    if (const int l = levelOf(x, y, z, kind))
+        return l;
+    const df::tiletype *tt = Maps::getTileType(x, y, z);
+    if (!tt)
+        return 0;
+    const df::tiletype_shape shape = tileShape(*tt);
+    const df::tiletype_shape_basic basic = tileShapeBasic(shape);
+    if (basic == df::tiletype_shape_basic::Ramp) {
+        // (a slope's snow may be kept on the open tile over it)
+        const df::tiletype *above = Maps::getTileType(x, y, z + 1);
+        return above && tileShape(*above) == df::tiletype_shape::RAMP_TOP ? levelOf(x, y, z + 1, kind) : 0;
+    }
+    if (shape == df::tiletype_shape::RAMP_TOP)
+        return levelOf(x, y, z - 1, kind);   // the slope below is this tile's surface
+    if (from_slope && basic == df::tiletype_shape_basic::Wall)
+        return levelOf(x, y, z + 1, kind);   // a slope runs up onto the wall's top
+    return 0;
+}
+
+uint32_t Spatters::holesAt(int x, int y, int z) {
+    // mud or dust on the tiles around, 0..5 each
+    int mud[3][3];
+    bool any = false;
+    for (int j = 0; j < 3; ++j)
+        for (int i = 0; i < 3; ++i) {
+            Top all[16];
+            const int n = kinds(x + i - 1, y + j - 1, z, all, 16);
+            int m = 0;
+            for (int k = 0; k < n; ++k)
+                if (all[k].kind == MUD || all[k].kind == DUST)
+                    m = std::max(m, all[k].level);
+            mud[j][i] = m;
+            any |= m > 0;
+        }
+    if (!any)
+        return 0;
+    // each corner by the four tiles that meet there, so neighbours agree on it
+    // and the holes thin out across the border instead of stopping at it
+    const auto corner = [&](int cx, int cy) {
+        const int sum = mud[cy][cx] + mud[cy][cx + 1] + mud[cy + 1][cx] + mud[cy + 1][cx + 1];   // 0..20
+        return uint32_t((sum + 1) / 2);
+    };
+    const uint32_t c = corner(0, 0) | corner(1, 0) << 4 | corner(0, 1) << 8 | corner(1, 1) << 12;
+    if (!c)
+        return 0;
+    return c | uint32_t(x & 7) << 16 | uint32_t(y & 7) << 19;
+}
+
+int32_t Spatters::pictureAt(int x, int y, int z, Kind kind, int level, bool slope) {
+    if (!level || kind == NONE)
+        return 0;
+    // (the kind in the hash: layers of different kinds on one tile vary apart)
+    const uint32_t h = tile_hash(x, y, z) ^ (uint32_t(kind) * 0x9e3779b9u);
+    if (scattered(kind))
+        return picture(kind, int(h % 4), 4 - std::min(level, 4));
+    if (level < 5)
+        return picture(kind, 4 + int(h % 4), 4 - level);
+    int sides = 0;
+    const int dx[4] = {0, 0, -1, 1}, dy[4] = {-1, 1, 0, 0};
+    for (int i = 0; i < 4; ++i)
+        if (levelBeside(x + dx[i], y + dy[i], z, kind, slope) == 5)
+            sides |= 1 << i;
+    if (sides == 15) {
+        const int8_t *v = FULL_INSIDE[h % 5];
+        return picture(kind, v[0], v[1]);
+    }
+    return picture(kind, FULL[sides][0], FULL[sides][1]);
 }
 
 int32_t Spatters::fromMap(int x, int y, int z) {
     loadPages();
     const Top t = top(x, y, z);
-    if (!t.level || t.kind == NONE)
-        return 0;
-    const uint32_t h = tile_hash(x, y, z);
-    if (scattered(t.kind))
-        return picture(t.kind, int(h % 4), 4 - std::min(t.level, 4));
-    if (t.level < 5)
-        return picture(t.kind, 4 + int(h % 4), 4 - t.level);
-    int sides = 0;
-    const int dx[4] = {0, 0, -1, 1}, dy[4] = {-1, 1, 0, 0};
-    for (int i = 0; i < 4; ++i) {
-        const Top n = top(x + dx[i], y + dy[i], z);
-        if (n.level == 5 && n.kind == t.kind)
-            sides |= 1 << i;
+    return pictureAt(x, y, z, t.kind, t.level);
+}
+
+int Spatters::layers(int x, int y, int z, int32_t seen, bool slope, Layer *out, int max) {
+    loadPages();
+    Top all[16];
+    int n = kinds(x, y, z, all, 16);
+    int from_z = z;
+    if (!n && slope) {
+        // what lies on a slope may be kept on the open tile over it
+        const df::tiletype *above = Maps::getTileType(x, y, z + 1);
+        if (above && tileShape(*above) == df::tiletype_shape::RAMP_TOP) {
+            n = kinds(x, y, z + 1, all, 16);
+            from_z = z + 1;
+        }
     }
-    if (sides == 15) {
-        const int8_t *v = FULL_INSIDE[h % 5];
-        return picture(t.kind, v[0], v[1]);
+    // mud and dust lie on the ground, snow falls on them, blood and the rest
+    // land on the snow
+    const auto rank = [](Kind k) { return k == MUD || k == DUST ? 0 : k == SNOW ? 1 : 2; };
+    std::sort(all, all + n, [&](const Top &a, const Top &b) {
+        return rank(a.kind) != rank(b.kind) ? rank(a.kind) < rank(b.kind) : a.amount < b.amount;
+    });
+    const auto seen_kind = seen ? kind_of_picture_.find(seen) : kind_of_picture_.end();
+    bool used_seen = seen_kind == kind_of_picture_.end();
+    int count = 0;
+    for (int i = 0; i < n && count < max; ++i) {
+        if (!all[i].level || all[i].kind == NONE)
+            continue;
+        Layer l;
+        if (!used_seen && all[i].kind == seen_kind->second) {
+            // a full cover is joined here instead: the game joins it only with
+            // neighbours where that kind is on top, so snow next to mud and snow
+            // would get an edge
+            l.tp = all[i].level < 5 ? seen : pictureAt(x, y, z, all[i].kind, all[i].level, slope);
+            used_seen = true;
+        } else {
+            l.tp = pictureAt(x, y, z, all[i].kind, all[i].level, slope);
+        }
+        if (all[i].kind == SNOW)
+            l.holes = holesAt(x, y, from_z);
+        if (l.tp)
+            out[count++] = l;
     }
-    return picture(t.kind, FULL[sides][0], FULL[sides][1]);
+    // the game shows something the map does not explain: keep it on top
+    if (!used_seen && count < max)
+        out[count++] = Layer{seen, 0};
+    return count;
+}
+
+bool Spatters::snow(int x, int y, int z, int32_t &top_tp, int32_t &side_tp) {
+    loadPages();
+    // (snow lies over mud and dust, so it shows whichever there is more of)
+    const int level = levelOf(x, y, z, SNOW);
+    if (!level)
+        return false;
+    top_tp = pictureAt(x, y, z, SNOW, level);
+    // the sides catch less than the top: two steps less cover, never joined up
+    const int side_level = std::max(1, level - 2);
+    side_tp = picture(SNOW, 4 + int(tile_hash(x, y, z) % 4), 4 - side_level);
+    return top_tp != 0;
+}
+
+int Spatters::snowLevel(int x, int y, int z) {
+    loadPages();
+    return std::min(levelOf(x, y, z, SNOW), 5);
 }
 
 void Spatters::learn(int x, int y, int z, int32_t tp) {

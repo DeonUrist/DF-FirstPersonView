@@ -11,6 +11,7 @@ No libraries needed.
 """
 import math
 import os
+import re
 import struct
 import zlib
 
@@ -207,6 +208,55 @@ img.ellipse(20.5, 20.5, 3, 3, YELLOW)
 img.outline(BLACK)
 img.save('aim_wrestle.png')
 
+# nock and unnock: an arrow, green to put it on the string, blue to take it off
+def arrow_mark(color):
+    img = Img(41, 41)
+    d = (0.7071, -0.7071)
+    p = (0.7071, 0.7071)
+    def at(along, side):
+        return (20.5 + d[0] * along + p[0] * side, 20.5 + d[1] * along + p[1] * side)
+    img.poly([at(-17, -1.3), at(9, -1.3), at(9, 1.3), at(-17, 1.3)], color)
+    img.poly([at(19, 0), at(8, -5.5), at(8, 5.5)], color)
+    for back in (-17, -13):
+        img.poly([at(back, 0), at(back - 4, -5), at(back, -5), at(back + 4, 0)], color)
+        img.poly([at(back, 0), at(back - 4, 5), at(back, 5), at(back + 4, 0)], color)
+    img.outline(BLACK)
+    return img
+
+
+arrow_mark((96, 224, 96, 255)).save('aim_nock.png')
+arrow_mark((110, 176, 255, 255)).save('aim_unnock.png')
+
+CYAN = (110, 210, 255, 255)
+GREEN = (120, 230, 120, 255)
+WHITE = (240, 240, 240, 255)
+
+# info: a ring with an "i" in it
+img = Img(41, 41)
+img.ring(20.5, 20.5, 14, 2.4, CYAN)
+img.ellipse(20.5, 13.5, 2, 2, CYAN)
+img.rect(18.5, 17.5, 22.5, 28.5, CYAN)
+img.rect(16.5, 26.5, 24.5, 28.5, CYAN)
+img.outline(BLACK)
+img.save('aim_info.png')
+
+# interact: a speech bubble with a dot in the middle
+img = Img(41, 41)
+img.shape(lambda x, y: 11 <= math.hypot((x - 20.5) / 1.25, y - 19) <= 13.4, GREEN)
+img.poly([(12, 27), (8, 36), (19, 30)], GREEN)
+img.ellipse(20.5, 19.5, 2.5, 2.5, GREEN)
+img.outline(BLACK)
+img.save('aim_interact.png')
+
+# walk: two footprints, one each side of the aim point
+img = Img(41, 41)
+for (fx, fy) in ((12.5, 26), (28.5, 14)):
+    img.ellipse(fx, fy - 3, 3.6, 5, WHITE)      # the ball of the foot
+    img.ellipse(fx, fy + 5.5, 2.8, 3, WHITE)    # the heel
+img.ellipse(20.5, 20.5, 1.6, 1.6, WHITE)
+img.outline(BLACK)
+img.save('aim_walk.png')
+
 # ---------------------------------------------------------------------------
 # buttons next to the minimap: 16 x 12, two interface cells
 
@@ -388,6 +438,91 @@ img.outline(BLACK)
 img.save('wound_cut.png')
 
 # ---------------------------------------------------------------------------
+# the two buttons at the pointer when you shoot or throw at a creature: 96 x 24, which
+# is 12 interface cells by 2, words included
+
+LETTERS = {
+    'Q': [".###.", "#...#", "#...#", "#...#", "#.#.#", "#..#.", ".##.#"],
+    'A': [".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"],
+    'D': ["####.", "#...#", "#...#", "#...#", "#...#", "#...#", "####."],
+    'u': [".....", ".....", "#...#", "#...#", "#...#", "#..##", ".##.#"],
+    'i': ["..#..", ".....", ".##..", "..#..", "..#..", "..#..", ".###."],
+    'c': [".....", ".....", ".###.", "#....", "#....", "#...#", ".###."],
+    'k': ["#....", "#....", "#..#.", "#.#..", "##...", "#.#..", "#..#."],
+    's': [".....", ".....", ".####", "#....", ".###.", "....#", "####."],
+    'h': ["#....", "#....", "#.##.", "##..#", "#...#", "#...#", "#...#"],
+    'g': [".....", ".####", "#...#", "#...#", ".####", "....#", ".###."],
+    'o': [".....", ".....", ".###.", "#...#", "#...#", "#...#", ".###."],
+    't': [".#...", ".#...", "###..", ".#...", ".#...", ".#..#", "..##."],
+    'm': [".....", ".....", "##.#.", "#.#.#", "#.#.#", "#...#", "#...#"],
+    'e': [".....", ".....", ".###.", "#...#", "#####", "#....", ".###."],
+    'd': ["....#", "....#", ".##.#", "#..##", "#...#", "#...#", ".####"],
+    'r': [".....", ".....", "#.##.", "##..#", "#....", "#....", "#...."],
+    'w': [".....", ".....", "#...#", "#...#", "#.#.#", "#.#.#", ".#.#."],
+}
+
+
+def shot_button(words):
+    img = Img(96, 24)
+    img.rect(0, 0, 96, 24, BLACK)
+    img.rect(1, 1, 95, 23, (196, 160, 96, 255))     # the lit edge, top and left
+    img.rect(2, 2, 95, 23, (96, 74, 44, 255))       # the edge in shade, bottom and right
+    img.rect(2, 2, 94, 22, (150, 118, 68, 255))
+    img.rect(3, 3, 93, 21, (46, 40, 36, 255))
+    x = (96 - (len(words) * 6 - 1)) // 2
+    for ch in words:
+        for dy, row in enumerate(LETTERS.get(ch, [])):
+            for dx, bit in enumerate(row):
+                if bit == '#':
+                    img.put(x + dx + 1, 9 + dy + 1, BLACK)
+        for dy, row in enumerate(LETTERS.get(ch, [])):
+            for dx, bit in enumerate(row):
+                if bit == '#':
+                    img.put(x + dx, 9 + dy, (255, 255, 255, 255))
+        x += 6
+    return img
+
+
+shot_button('Quick shot').save('shot_quick.png')
+shot_button('Aimed shot').save('shot_aimed.png')
+shot_button('Quick throw').save('throw_quick.png')
+shot_button('Aimed throw').save('throw_aimed.png')
+shot_button('Quick strike').save('strike_quick.png')
+shot_button('Aimed strike').save('strike_aimed.png')
+shot_button('Dodge').save('dodge.png')
+
+# ---------------------------------------------------------------------------
+# struck at: the mark that points from the pointer at whoever struck at you.
+# The top of the picture is the end towards the attacker.
+
+# it wounded you: a red arrow with a barbed head
+img = Img(48, 96)
+img.poly([(24, 2), (45, 40), (24, 28), (3, 40)], (235, 30, 30, 255))
+img.poly([(21.5, 26), (26.5, 26), (25, 94), (23, 94)], (235, 30, 30, 255))
+img.outline(BLACK)
+img.outline(BLACK)
+img.save('struck_hit.png')
+
+# it missed: two green chevrons, nothing solid behind them
+img = Img(48, 96)
+for top in (4, 40):
+    img.poly([(24, top), (45, top + 36), (37, top + 40), (24, top + 16), (11, top + 40), (3, top + 36)],
+             (70, 230, 90, 255))
+img.outline(BLACK)
+img.outline(BLACK)
+img.save('struck_miss.png')
+
+# ---------------------------------------------------------------------------
+# the arrow on the minimap for the way you face: the top of the picture is
+# forward. Half see-through, so the tile under it shows.
+
+img = Img(36, 36)
+img.poly([(18, 2.5), (32.5, 18.5), (22, 18.5), (22, 32.5), (14, 32.5), (14, 18.5), (3.5, 18.5)], (255, 255, 255, 128))
+img.outline((0, 0, 0, 128))
+img.outline((0, 0, 0, 128))
+img.save('minimap_arrow.png')
+
+# ---------------------------------------------------------------------------
 # compass: a strip with all eight directions that slides behind a frame
 
 LETTERS = {
@@ -530,6 +665,234 @@ from_rows([
     "................",
 ], ICON).save('icon_settings.png')
 
+
+# ---------------------------------------------------------------------------
+# the sky (media/sky): sun, moon phases, stars, clouds, rain and snow
+
+# the icons of the bars under and above the player's paperdoll, from the rows
+# built into the plugin (plugin/vital_icons.inc), so the two stay the same
+def vital_icons():
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'plugin', 'vital_icons.inc'),
+               encoding='utf-8').read()
+    colours = {k: (int(r), int(g), int(b), 255)
+               for k, r, g, b in re.findall(r"\{'(.)', (\d+), (\d+), (\d+)\}", src)}
+    for name, body in re.findall(r'\{"(\w+)", \{(.*?)\}\}', src, re.S):
+        rows = re.findall(r'"([^"]*)"', body)
+        assert len(rows) == 12 and all(len(r) == 12 for r in rows), name
+        assert all(ch == '.' or ch in colours for r in rows for ch in r), name
+        from_rows(rows, colours).save('vitals/%s.png' % name)
+
+
+vital_icons()
+
+
+def sky_sun():
+    img = Img(32, 32)
+    c = 16
+    for y in range(32):
+        for x in range(32):
+            dx, dy = x + 0.5 - c, y + 0.5 - c
+            r = math.hypot(dx, dy)
+            ang = math.atan2(dy, dx)
+            if r <= 5:
+                img.put(x, y, (255, 255, 236, 255))
+            elif r <= 7:
+                img.put(x, y, (255, 238, 150, 255))
+            elif r <= 8:
+                img.put(x, y, (255, 206, 70, 255))
+            elif r <= 10:
+                img.put(x, y, (255, 214, 110, 90))
+            else:
+                # rays: long ones up, down and to the sides, short ones between
+                k = (ang / (math.pi / 4)) % 1.0
+                near = min(k, 1 - k)
+                step = round(ang / (math.pi / 4)) % 2
+                reach = 15 if step == 0 else 12
+                if near * r < 0.9 and r <= reach:
+                    a = 230 if r < reach - 2 else 140
+                    img.put(x, y, (255, 196, 70, a))
+    img.save('sky/sun.png')
+
+
+def sky_moons():
+    size, rad = 24, 10.0
+    craters = [(-3, -3, 2.2), (3, 1, 1.8), (-1, 4, 1.5), (4, -4, 1.2), (-5, 2, 1.0)]
+    for phase in range(8):
+        img = Img(size, size)
+        phi = phase / 8 * 2 * math.pi
+        lx, lz = math.sin(phi), -math.cos(phi)
+        for y in range(size):
+            for x in range(size):
+                dx, dy = x + 0.5 - size / 2, y + 0.5 - size / 2
+                d2 = dx * dx + dy * dy
+                if d2 > rad * rad:
+                    continue
+                nx, nz = dx / rad, math.sqrt(max(0.0, 1 - d2 / (rad * rad)))
+                lit = nx * lx + nz * lz
+                if lit > 0.05:
+                    col = (236, 232, 208)
+                    for cx, cy, cr in craters:
+                        if math.hypot(dx - cx, dy - cy) <= cr:
+                            col = (200, 196, 176)
+                    if d2 > (rad - 1.2) ** 2:
+                        col = (214, 210, 188)
+                    img.put(x, y, col + (255,))
+                elif lit > -0.05:
+                    img.put(x, y, (150, 150, 140, 200))
+                else:
+                    # the dark side: only a faint disc against the sky
+                    img.put(x, y, (70, 76, 100, 60))
+        img.save('sky/moon_%d.png' % phase)
+
+
+def sky_stars():
+    img = Img(30, 5)
+    def star(f, pts):
+        for (x, y), c in pts:
+            img.put(f * 5 + x, y, c)
+    star(0, [((2, 2), (200, 200, 215, 200))])
+    star(1, [((2, 2), (255, 255, 255, 255))])
+    star(2, [((2, 2), (255, 250, 225, 255))] + [((2 + dx, 2 + dy), (255, 250, 225, 90))
+                                                  for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))])
+    star(3, [((2, 2), (255, 255, 255, 255))] + [((2 + dx, 2 + dy), (190, 205, 255, 160))
+                                                  for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))])
+    star(4, [((2, 2), (255, 244, 205, 255))] +
+         [((2 + dx, 2 + dy), (255, 236, 190, 200)) for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))] +
+         [((2 + dx, 2 + dy), (255, 236, 190, 80)) for dx, dy in ((2, 0), (-2, 0), (0, 2), (0, -2))])
+    star(5, [((2, 2), (255, 255, 255, 255))] +
+         [((2 + dx, 2 + dy), (225, 235, 255, 210)) for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))] +
+         [((2 + dx, 2 + dy), (225, 235, 255, 110)) for dx, dy in ((2, 0), (-2, 0), (0, 2), (0, -2))] +
+         [((2 + dx, 2 + dy), (225, 235, 255, 60)) for dx, dy in ((1, 1), (-1, 1), (1, -1), (-1, -1))])
+    img.save('sky/stars.png')
+
+
+def tile_noise(w, h, cx, cy, seed):
+    """smooth noise that repeats across the picture's edges"""
+    import random
+    rnd = random.Random(seed)
+    grid = [[rnd.random() for _ in range(cx)] for _ in range(cy)]
+    out = [0.0] * (w * h)
+    for y in range(h):
+        fy = y * cy / h
+        iy = int(fy)
+        ty = fy - iy
+        ty = ty * ty * (3 - 2 * ty)
+        r0, r1 = grid[iy % cy], grid[(iy + 1) % cy]
+        for x in range(w):
+            fx = x * cx / w
+            ix = int(fx)
+            tx = fx - ix
+            tx = tx * tx * (3 - 2 * tx)
+            x0, x1 = ix % cx, (ix + 1) % cx
+            a = r0[x0] + (r0[x1] - r0[x0]) * tx
+            b = r1[x0] + (r1[x1] - r1[x0]) * tx
+            out[y * w + x] = a + (b - a) * ty
+    return out
+
+
+def fbm(w, h, cx, cy, octaves, seed):
+    total = [0.0] * (w * h)
+    amp, norm = 1.0, 0.0
+    for o in range(octaves):
+        n = tile_noise(w, h, cx << o, cy << o, seed * 31 + o)
+        for i in range(w * h):
+            total[i] += n[i] * amp
+        norm += amp
+        amp *= 0.5
+    return [t / norm for t in total]
+
+
+def puffy(name, threshold, seed, light, mid, dark, alpha=255, cells=5):
+    """heaps of cloud: lit on one side, shadowed on the other, in a few flat shades"""
+    w = h = 256
+    d = fbm(w, h, cells, cells, 4, seed)
+    img = Img(w, h)
+    for y in range(h):
+        for x in range(w):
+            v = d[y * w + x]
+            if v < threshold:
+                continue
+            up = d[((y - 4) % h) * w + x]
+            down = d[((y + 4) % h) * w + x]
+            if down < threshold + 0.01:
+                col = dark
+            elif up < v - 0.02 or v - threshold > 0.12:
+                col = light
+            else:
+                col = mid
+            a = alpha if v - threshold > 0.015 else alpha * 2 // 3
+            img.put(x, y, col + (a,))
+    img.save(name)
+
+
+def wisps(name, seed):
+    """long thin streaks, high up"""
+    w = h = 256
+    d = fbm(w, h, 2, 16, 3, seed)
+    m = fbm(w, h, 4, 4, 2, seed + 7)
+    img = Img(w, h)
+    for y in range(h):
+        for x in range(w):
+            v = d[y * w + x] * 0.7 + m[y * w + x] * 0.3
+            if v < 0.56:
+                continue
+            a = 70 if v < 0.6 else 120 if v < 0.65 else 160
+            img.put(x, y, (246, 248, 252, a))
+    img.save(name)
+
+
+def sheet(name, seed, base, blot, alpha_lo, alpha_hi, cells=6, ripple=0.0):
+    """a cover over the whole sky, thicker and thinner in places"""
+    w = h = 256
+    d = fbm(w, h, cells, cells, 4, seed)
+    img = Img(w, h)
+    for y in range(h):
+        for x in range(w):
+            v = d[y * w + x]
+            if ripple:
+                v += ripple * math.sin((x + y * 0.3) * 2 * math.pi / 16)
+            col = blot if v > 0.58 else base
+            a = alpha_lo if v < 0.45 else (alpha_lo + alpha_hi) // 2 if v < 0.55 else alpha_hi
+            img.put(x, y, col + (a,))
+    img.save(name)
+
+
+def sky_clouds():
+    puffy('sky/clouds_cumulus.png', 0.6, 1, (252, 252, 254), (228, 231, 238), (182, 188, 202))
+    puffy('sky/clouds_cumulus_many.png', 0.52, 2, (250, 250, 252), (224, 227, 234), (176, 182, 196))
+    puffy('sky/clouds_nimbus.png', 0.36, 3, (150, 154, 162), (120, 124, 134), (88, 92, 102), 248, cells=4)
+    wisps('sky/clouds_cirrus.png', 4)
+    sheet('sky/clouds_altostratus.png', 5, (214, 218, 226), (196, 200, 210), 90, 170, ripple=0.04)
+    sheet('sky/clouds_stratus.png', 6, (170, 174, 182), (150, 154, 162), 228, 250)
+
+
+def sky_drops():
+    rain = Img(2, 12)
+    for y in range(12):
+        a = 60 + 160 * y // 11
+        rain.put(0, y, (205, 218, 236, a))
+        rain.put(1, y, (205, 218, 236, a * 2 // 5))
+    rain.save('sky/rain.png')
+    snow = Img(15, 5)
+    white = (245, 248, 255)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            snow.put(2 + dx, 2 + dy, white + (255 if dx == 0 and dy == 0 else 150,))
+    for dx, dy in ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)):
+        snow.put(7 + dx, 2 + dy, white + (255,))
+    for dx, dy in ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1), (2, 0), (-2, 0), (0, 2), (0, -2)):
+        snow.put(12 + dx, 2 + dy, white + (255 if abs(dx) + abs(dy) < 2 else 160,))
+    for dx, dy in ((1, 1), (-1, 1), (1, -1), (-1, -1)):
+        snow.put(12 + dx, 2 + dy, white + (110,))
+    snow.save('sky/snow.png')
+
+
+sky_sun()
+sky_moons()
+sky_stars()
+sky_clouds()
+sky_drops()
+
 README = os.path.join(ROOT, 'README.txt')
 if os.path.exists(README):
     print('kept README.txt')
@@ -542,10 +905,15 @@ unless noted. Delete a file to get the plain built-in look for it.
 cursor.png          the pointer over the view while it is free (Alt held, or a menu open).
                     The top left corner is the tip.
 crosshair.png       the crosshair in the middle of the view. The middle of the picture is the aim point.
-aim_strike.png      the crosshair while Ctrl is held, one per intent (Ctrl+R switches)
+aim_info.png        the crosshair for each intent, in place of crosshair.png (R switches the intent)
+aim_interact.png    Info, Interact, Walk, Strike, Shoot, Throw, Wrestle. The middle of the picture
+aim_walk.png        is the aim point. One that is missing falls back to crosshair.png.
+aim_strike.png
 aim_shoot.png
 aim_throw.png
 aim_wrestle.png
+aim_nock.png        with Shoot and no arrow on the string (no bolt in the crossbow): a click nocks (loads) one
+aim_unnock.png      with Unnock (Unload): a click takes the arrow off the string (the bolt out)
 icon_ascii.png      the three buttons next to the minimap, 16 x 12 pixels (two interface cells)
 icon_zoom_in.png
 icon_zoom_out.png
@@ -562,14 +930,48 @@ button_sleep.png    Exactly 32 x 36 pixels each. Only used when the game has no
                     seconds, so a changed one shows without a reload.
 compass.png        the compass: one strip with N NE E SE S SW W NW, each an eighth of its width,
                     N in the first eighth. It slides behind the frame as you turn.
-                    It is drawn twice as wide as the picture.
+                    It is drawn 1 1/3 times as wide as the picture.
 compass_frame.png   the frame over the strip; transparent where the strip shows through
-                    It is drawn four times as wide: the 8 pixels at each end and the
+                    It is drawn 2 2/3 times as wide: the 8 pixels at each end and the
                     16 in the middle stay as they are, the rest is stretched.
 wound_bruise.png    marks on your own paperdoll (bottom left) where a body part is bruised or cut
 wound_cut.png
-checkbox_on.png     the boxes in the attack menu
+minimap_arrow.png   the arrow on the minimap that shows the way you face. The top of the picture is
+                    forward; it is turned for the other directions and drawn with its own
+                    transparency. Square; any size.
+struck_hit.png      the mark that points from the pointer at whoever struck at you: one for a strike
+struck_miss.png     that wounded you, one for a miss. The top of the picture is the end towards the
+                    attacker; it is turned to point at them and drawn about a tenth of the window
+                    high, its bottom a little way from the pointer
+shot_quick.png      the two buttons at the pointer when you click a creature with Shoot: Quick shot
+shot_aimed.png      (drawn just above the pointer) and Aimed shot (just below). The words are part of
+                    the picture. Made for interface cells of 8 x 12 pixels (96 x 24 is 12 cells by 2);
+                    drawn larger when the interface is.
+throw_quick.png     the same two buttons for Throw
+throw_aimed.png
+strike_quick.png    the same two buttons for Strike: Quick strike hits at once, Aimed strike goes on
+strike_aimed.png    to the choice of where to hit
+dodge.png           a third button under those two while someone is striking at you: Dodge
+checkbox_on.png    the boxes in the attack menu
 checkbox_off.png
+sky/sun.png         the sun. Its middle is where the sun is; one pixel of it covers about a third
+                    of a degree of the sky, whatever the window's size.
+sky/moon_0.png      the moon in each of its eight phases: 0 new, 1 waxing crescent, 2 first quarter,
+ ... moon_7.png     3 waxing gibbous, 4 full, 5 waning gibbous, 6 last quarter, 7 waning crescent.
+                    Drawn lit from the right while it waxes (0-4) and from the left while it wanes;
+                    it is turned so that the lit side faces the sun. Transparent pixels show the sky.
+sky/stars.png       a row of square star pictures (as many as the row is wide / high). Small ones
+                    first: most stars use the first pictures, few the last. They twinkle and turn
+                    with the night.
+sky/clouds_cirrus.png         the kinds of cloud the game has, each a picture that repeats across a
+sky/clouds_cumulus.png        flat ceiling high over you (so the clouds shrink towards the horizon)
+sky/clouds_cumulus_many.png   and drifts with the wind. Any size; the edges must fit together.
+sky/clouds_nimbus.png         Transparency is how thick the cloud is. Coloured by the light of the
+sky/clouds_altostratus.png    hour (white by day, dark at night, warm at dawn and dusk), so draw them
+sky/clouds_stratus.png        in plain greys. Cirrus is highest, stratus (the overcast) lowest.
+sky/rain.png        one raindrop, top to bottom; it is stretched along the way it falls. A rain of
+                    something else (blood rain) takes the drop's lightness in that thing's colour.
+sky/snow.png        a row of square snowflakes; each flake picks one.
 dolls/NAME.png      a paperdoll for the "aim for" menu
 dolls/NAME.txt      where each body part is on NAME.png (see the comments inside)
 

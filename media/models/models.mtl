@@ -1,0 +1,18 @@
+# Materials of the models (see README.txt)
+newmtl own
+Kd 0.800000 0.800000 0.800000
+
+newmtl picture
+Kd 0.800000 0.800000 0.800000
+
+newmtl grit_sheet
+Kd 0.617207 0.564712 0.456411
+
+newmtl grit_pillow
+Kd 0.854993 0.838799 0.775822
+
+newmtl grit_cloth
+Kd 0.304987 0.011612 0.015996
+
+newmtl smooth_rope
+Kd 0.332452 0.181164 0.061246

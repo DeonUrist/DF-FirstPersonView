@@ -52,9 +52,9 @@ Pick pick_ray(const Scene &scene, const Camera &cam, const RenderOptions &opt, i
     Pick result;
     const View3D v = View3D::of(cam, W, H);
     const int zlo = std::max(0, opt.zlo);
-    const int zhi = std::min({opt.zhi, scene.d - 1, zlo + 63});
+    const int zhi = std::min(opt.zhi, scene.d - 1);
     const int nz = std::max(0, zhi - zlo + 1);
-    const Cell *cells[64] = {};
+    std::vector<const Cell *> cells(size_t(nz), nullptr);
     for (int k = 0; k < nz; ++k)
         if (const Level *L = scene.level(zlo + k))
             cells[k] = L->cells.data();
@@ -142,11 +142,14 @@ Pick pick_ray(const Scene &scene, const Camera &cam, const RenderOptions &opt, i
                         if (t0 > 1e-4f) {
                             if (axis == 2) {
                                 if (Dz < 0)
-                                    flat(c.solid, t0, 1.0f);
+                                    flat(c.top ? c.top : c.solid, t0, 1.0f);
                                 else
-                                    flat(roof ? roof : c.solid, t0, 0.7f);
+                                    flat(c.half ? c.half : roof ? roof : c.solid, t0, 0.7f);
                             } else if (axis >= 0) {
-                                const Tex &tex = scene.tex.get(c.solid);
+                                // a built wall's plain bands at its foot and head
+                                const bool band = c.trim && (((c.flags & CELL_FOOT) && hz0 < z0 + TRIM_H) ||
+                                                             ((c.flags & CELL_HEAD) && hz0 >= z1 - TRIM_H));
+                                const Tex &tex = scene.tex.get(band ? c.trim : c.solid);
                                 best = t0;
                                 color = face_px(tex, side_u(hx0, hy0), hz0, z0, z1);
                                 dark = axis == 1 ? 0.82f : 1.0f;
@@ -225,6 +228,8 @@ Pick pick_ray(const Scene &scene, const Camera &cam, const RenderOptions &opt, i
                                     flat(c.top ? c.top : c.half, t, 1.0f);
                             }
                         }
+                        // (water is not hit: the pointer aims through it at the bottom
+                        // and at what swims there)
                         // shapes standing inside the tile
                         if (c.box && c.box < nboxsets && scene.col_box[ci]) {
                             const BoxSet &set = scene.boxsets[c.box];
@@ -236,7 +241,29 @@ Pick pick_ray(const Scene &scene, const Camera &cam, const RenderOptions &opt, i
                                 float tin = -FAR_T, tout = FAR_T;
                                 int ax = -1;
                                 bool miss = false;
-                                for (int q = 0; q < 3 && !miss; ++q) {
+                                float rnu = 0, rnv = 0;
+                                if (b.round) {
+                                    // a round piece: its outline across, its top and bottom up and down
+                                    float a, z;
+                                    miss = !roundClip(b, Ox - mx, Oy - my, Dx, Dy, tin, tout, rnu, rnv);
+                                    ax = 0;
+                                    if (!miss && Dz != 0) {
+                                        a = (lo[2] - Oz) / Dz;
+                                        z = (hi[2] - Oz) / Dz;
+                                        if (a > z)
+                                            std::swap(a, z);
+                                        if (a > tin) {
+                                            tin = a;
+                                            ax = 2;
+                                        }
+                                        tout = std::min(tout, z);
+                                    } else if (!miss && (Oz < lo[2] || Oz > hi[2])) {
+                                        miss = true;
+                                    }
+                                    if (!miss && ax == 0 && rnu == 0 && rnv == 0)
+                                        miss = true;   // starts inside it
+                                }
+                                for (int q = 0; q < 3 && !miss && !b.round; ++q) {
                                     if (D3[q] == 0) {
                                         if (O3[q] < lo[q] || O3[q] > hi[q])
                                             miss = true;
@@ -258,7 +285,7 @@ Pick pick_ray(const Scene &scene, const Camera &cam, const RenderOptions &opt, i
                                 float shade = 1;
                                 if (ax == 2) {
                                     const bool top = Dz < 0;
-                                    const Tex &tex = scene.tex.get(top ? b.top : b.side);
+                                    const Tex &tex = scene.tex.get(top ? b.top : (b.under ? b.under : b.side));
                                     int u, vv;
                                     if (tex.stretch) {
                                         u = std::clamp(int((hx - lo[0]) * 32.0f / std::max(b.u1 - b.u0, 1e-3f)), 0, 31);
@@ -269,6 +296,13 @@ Pick pick_ray(const Scene &scene, const Camera &cam, const RenderOptions &opt, i
                                     }
                                     px = tex.px[(vv << 5) | u];
                                     shade = top ? 1.0f : 0.6f;
+                                } else if (b.round) {
+                                    const Tex &tex = scene.tex.get(b.side);
+                                    const float down = std::clamp((hi[2] - hz) / std::max(hi[2] - lo[2], 1e-4f), 0.0f, 0.999f);
+                                    const int texx = std::min(31, int(frac(hy * rnu - hx * rnv) * 32));
+                                    const int texy = int(down * (b.z1 - b.z0) * 32) & 31;
+                                    px = tex.px[(texy << 5) + texx];
+                                    shade = 0.8f + 0.2f * std::abs(rnu);
                                 } else {
                                     const uint8_t bit = ax == 0 ? (Dx > 0 ? FACE_W : FACE_E) : (Dy > 0 ? FACE_N : FACE_S);
                                     const bool pictured = b.face && (b.face_sides & bit);

@@ -21,6 +21,10 @@
 .PARAMETER DFPath
     The Dwarf Fortress install folder (where hack\plugins is).
 
+.PARAMETER NoPlugin
+    Install only the script mod and art, not the plugin (plugin\build.ps1
+    -Install does the plugin itself, and everything else through this script).
+
 .EXAMPLE
     .\plugin\build.ps1
     .\install.ps1
@@ -29,7 +33,8 @@ param(
     [string]$ModsDir = (Join-Path $env:APPDATA 'Bay 12 Games\Dwarf Fortress\mods'),
     [string]$DFPath = 'C:\Soft\Steam\steamapps\common\Dwarf Fortress',
     [switch]$Link,
-    [switch]$ResetMedia
+    [switch]$ResetMedia,
+    [switch]$NoPlugin
 )
 
 $ErrorActionPreference = 'Stop'
@@ -81,7 +86,9 @@ if ($Link) {
 $dll = Get-ChildItem (Join-Path $source '_refs\dfhack\build') -Recurse -Filter 'fpview.plug.dll' -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1
 $plugins = Join-Path $DFPath 'hack\plugins'
-if (-not $dll) {
+if ($NoPlugin) {
+    return
+} elseif (-not $dll) {
     Write-Warning 'fpview.plug.dll has not been built yet. Run plugin\build.ps1, then run this script again.'
 } elseif (-not (Test-Path $plugins)) {
     Write-Warning "DFHack plugin folder not found: $plugins (pass -DFPath)"

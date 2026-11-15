@@ -1,4 +1,5 @@
 #include "render.h"
+#include "sky.h"
 
 #include <algorithm>
 #include <cmath>
@@ -168,19 +169,23 @@ struct Renderer::Frame {
     float dirx, diry, rgtx, rgty, planex, planey;
     float S, hz;
     int hzi;
-    float view_dist, max_d;
+    float view_dist, max_d;   // haze distance; how far the map is drawn
+    float weather_haze = 0, weather_reach = 30;   // RenderOptions::weather_haze, weather_reach
     uint32_t fog;
+    const FarView *far = nullptr;     // the land beyond the map, or none
     int zlo, zhi, nz;
-    const Cell *cells[64];       // per level, null if not captured
-    float zrel[65];              // height of each level's floor relative to the eye
+    std::vector<const Cell *> cells;   // per level, null if not captured
+    std::vector<float> zrel;           // height of each level's floor relative to the eye, one more than levels
     int map_w, map_h;
     const int16_t *col_lo, *col_hi;   // per map tile: levels that have anything to draw
     const BoxSet *boxsets;            // shapes standing inside tiles
     const uint8_t *col_box;           // per map tile: whether any level has some
     int nboxsets;
     bool cam_sky;
+    const Sky *sky;
     uint16_t roof;
     Pick hl;
+    int wave = 0;                     // step of the waves' animation
     std::vector<const Billboard *> bills;   // far to near
     std::vector<float> bill_depth, bill_lat;
 };
@@ -208,12 +213,17 @@ void Renderer::render(const Scene &scene, const Camera &cam, const RenderOptions
     f.S = W / (2 * P);
     f.hz = H / 2.0f + cam.pitch;
     f.hzi = std::clamp(int(f.hz + 0.5f), 0, H);
-    f.view_dist = opt.view_distance;
+    f.view_dist = std::max(1.0f, opt.fog_distance > 0 ? opt.fog_distance : opt.view_distance);
     f.max_d = opt.view_distance + 4;
+    f.weather_haze = opt.weather_haze;
+    f.weather_reach = opt.weather_reach;
+    f.far = opt.far_land && scene.far && !scene.far->empty() ? scene.far.get() : nullptr;
     f.fog = opt.fog;
     f.zlo = std::max(0, opt.zlo);
-    f.zhi = std::min({opt.zhi, scene.d - 1, f.zlo + 63});
+    f.zhi = std::min(opt.zhi, scene.d - 1);
     f.nz = std::max(0, f.zhi - f.zlo + 1);
+    f.cells.assign(size_t(f.nz), nullptr);
+    f.zrel.assign(size_t(f.nz) + 1, 0.0f);
     for (int k = 0; k < f.nz; ++k) {
         const Level *L = scene.level(f.zlo + k);
         f.cells[k] = L ? L->cells.data() : nullptr;
@@ -229,6 +239,8 @@ void Renderer::render(const Scene &scene, const Camera &cam, const RenderOptions
     f.col_box = scene.col_box.data();
     f.nboxsets = int(scene.boxsets.size());
     f.hl = opt.highlight;
+    f.wave = opt.wave_frame;
+    f.sky = opt.sky && opt.sky->ready() ? opt.sky : nullptr;
 
     // is the camera itself under the open sky?
     f.cam_sky = false;
@@ -249,6 +261,9 @@ void Renderer::render(const Scene &scene, const Camera &cam, const RenderOptions
         masked_count_.assign(W, 0);
         row_inv_.assign(H, 0);
         sky_row_.assign(H, 0);
+        far_depth_.assign(size_t(W) * H, 0);
+        veil_.assign(size_t(W) * H, 0);
+        veil_d_.assign(size_t(W) * H, 0);
         last_w_ = W;
         last_h_ = H;
     }
@@ -322,10 +337,7 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
     const uint16_t roof = f.roof;
 
     const auto shade_factor = [&](float d) {
-        float t = d * inv_view;
-        if (t > 1)
-            t = 1;
-        return int(256 * (1 - 0.97f * t * std::sqrt(std::sqrt(t)) ));
+        return int(256 * (1 - haze_at(d * inv_view, f.view_dist, f.weather_haze, f.weather_reach)));
     };
 
     for (int sx = x0; sx < x1; ++sx) {
@@ -337,6 +349,19 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
             if (nspans < MAX_SPANS)
                 spans[nspans++] = Span{int16_t(a), int16_t(b), depth, int16_t(tx), int16_t(ty), int16_t(tz)};
         };
+        // water over the open rows of this column (see veil_)
+        uint32_t *veil = veil_.data() + size_t(sx) * H;
+        float *veil_d = veil_d_.data() + size_t(sx) * H;
+        int veil_lo = H, veil_hi = 0;
+        const auto veil_px = [&](int y, uint32_t texel, const Shade &shade, float d) {
+            if (!px_a(texel) || veil[y])
+                return;   // nothing there, or nearer water already
+            veil[y] = (shade(texel) & 0x00FFFFFFu) | (texel & 0xFF000000u);
+            veil_d[y] = d;
+            veil_lo = std::min(veil_lo, y);
+            veil_hi = std::max(veil_hi, y + 1);
+        };
+
 
         const float camx = (2 * (sx + 0.5f) / W) - 1;
         const float rx = f.dirx + f.planex * camx, ry = f.diry + f.planey * camx;
@@ -425,11 +450,17 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
                         const Cell &c = cells[ci];
                         uint16_t tid = 0;
                         float h0 = f.zrel[k], h1 = 0;
+                        // a built wall's plain bands at its foot and head, in tile widths
+                        float foot = 0, head = 0;
                         if (c.solid) {
                             if (prev_ci >= 0 && cells[prev_ci].solid)
                                 continue;   // buried between two blocks
                             tid = c.solid;
                             h1 = h0 + LEVEL_H;
+                            if (c.trim) {
+                                foot = (c.flags & CELL_FOOT) ? TRIM_H : 0;
+                                head = (c.flags & CELL_HEAD) ? TRIM_H : 0;
+                            }
                         } else if (c.ramp) {
                             // the side of a slope: as high as the slope is where the ray enters
                             if (prev_ci >= 0 && cells[prev_ci].solid)
@@ -470,17 +501,63 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
                         const int step = int(span * 65536.0f / (bot - top));
                         const int voff = int((std::ceil(span / 32.0f) * 32.0f - span) * 65536.0f);
                         const bool lit = tile_lit && f.zlo + k == f.hl.z;
+                        // screen rows where the bands begin: above y_head and from y_foot down
+                        const float y_head = head > 0 ? hz - (h1 - head) * inv0 : -1e9f;
+                        const float y_foot = foot > 0 ? hz - (h0 + foot) * inv0 : 1e9f;
+                        const Tex &band = scene.tex.get(head > 0 || foot > 0 ? cells[ci].trim : tid);
                         for (int i = 0; i < nv; ++i) {
                             const int s = va[i], e = vb[i];
                             int tpos = int((s + 0.5f - top) * step) + voff;
-                            for (int y = s; y < e; ++y) {
-                                col[y] = shade(tex.px[(((tpos >> 16) & 31) << 5) + texx]);
-                                tpos += step;
+                            if (head > 0 || foot > 0) {
+                                for (int y = s; y < e; ++y) {
+                                    const float yc = y + 0.5f;
+                                    const Tex &t = (yc < y_head || yc >= y_foot) ? band : tex;
+                                    col[y] = shade(t.px[(((tpos >> 16) & 31) << 5) + texx]);
+                                    tpos += step;
+                                }
+                            } else {
+                                for (int y = s; y < e; ++y) {
+                                    col[y] = shade(tex.px[(((tpos >> 16) & 31) << 5) + texx]);
+                                    tpos += step;
+                                }
                             }
                             if (lit)
                                 for (int y = s; y < e; ++y)
                                     col[y] = brighten(col[y]);
                             record(s, e, d0, mapx, mapy, f.zlo + k);
+                        }
+                    }
+                    // the side of a block of water standing higher than what is beside it
+                    for (int k = k_lo; k <= k_hi && open.n > 0; ++k) {
+                        const Cell *cells = f.cells[k];
+                        if (!cells || !cells[ci].water || prev_ci < 0)
+                            continue;
+                        const Cell &c = cells[ci], &p = cells[prev_ci];
+                        if (p.solid)
+                            continue;
+                        const float wt = water_height(c), wb = water_height(p);
+                        if (wt <= wb + 0.01f)
+                            continue;
+                        const float h0 = f.zrel[k] + wb * LEVEL_H, h1 = f.zrel[k] + wt * LEVEL_H;
+                        const float top = hz - h1 * inv0, bot = hz - h0 * inv0;
+                        const int a = top <= 0 ? 0 : int(top + 0.5f);
+                        const int b = bot >= H ? H : int(bot + 0.5f);
+                        if (a >= b || b <= open.a[0] || a >= open.b[open.n - 1])
+                            continue;
+                        const int nv = open.clip(a, b, va, vb);
+                        if (!nv)
+                            continue;
+                        face_texx();
+                        const Tex &tex = scene.tex.get(water_frame(c, f.wave));
+                        const Shade shade(f.fog, int(shade_factor(d0) * dark));
+                        const float span = (h1 - h0) * 32.0f;
+                        const float step = span / std::max(bot - top, 1e-3f);
+                        for (int i = 0; i < nv; ++i) {
+                            for (int y = va[i]; y < vb[i]; ++y) {
+                                // (the picture's bottom at the water's foot)
+                                const int v = int(128.0f - span + (y + 0.5f - top) * step) & 31;
+                                veil_px(y, tex.px[(v << 5) + texx], shade, d0);
+                            }
                         }
                     }
                 }
@@ -535,6 +612,36 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
                     }
                 };
 
+                // The surface of the water in the tile, seen from above: it
+                // covers nothing, only tints what will be drawn under it.
+                const auto water_top = [&](const Cell &c, float h, int tz) {
+                    if (h >= 0)
+                        return;
+                    const float far = hz - h * inv1;
+                    const int a = far <= 0 ? 0 : int(far + 0.5f);
+                    int b = H;
+                    if (d0 > 0) {
+                        const float near = hz - h * inv0;
+                        b = near >= H ? H : int(near + 0.5f);
+                    }
+                    if (a >= b || open.n == 0 || b <= open.a[0] || a >= open.b[open.n - 1])
+                        return;
+                    const int nv = open.clip(a, b, va, vb);
+                    if (!nv)
+                        return;
+                    const Tex &tex = scene.tex.get(water_frame(c, f.wave));
+                    const Shade shade(f.fog, shade_factor(d1));
+                    const float dh = -h;
+                    for (int i = 0; i < nv; ++i) {
+                        for (int y = va[i]; y < vb[i]; ++y) {
+                            const float d = dh * row_inv_[y];
+                            const int u = int((f.px + d * rx) * 32.0f) & 31;
+                            const int v = int((f.py + d * ry) * 32.0f) & 31;
+                            veil_px(y, tex.px[(v << 5) | u], shade, d);
+                        }
+                    }
+                };
+
                 // A slope. Along one ray it is (very nearly) a straight line from
                 // where the ray enters the tile to where it leaves, so each pixel
                 // row finds its point on that line.
@@ -569,6 +676,9 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
                             const int u = int((f.px + d * rx) * 32.0f) & 31;
                             const int v = int((f.py + d * ry) * 32.0f) & 31;
                             col[y] = shade(tex.px[(v << 5) | u]);
+                            // the part of a slope standing out of the water is not under it
+                            if (veil[y] && d < veil_d[y] - 1e-3f)
+                                veil[y] = 0;
                         }
                         if (tile_lit && tz == f.hl.z)
                             for (int y = s; y < e; ++y)
@@ -633,54 +743,69 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
                     }
                 };
 
-                // Shapes standing inside the tile (furniture, battlements): blocks
-                // the ray enters and leaves somewhere between the tile's edges.
-                // They are drawn before the tile's own floor: seen from the eye,
-                // the floor in front of a block lies below it on the screen and
-                // the floor behind it is hidden by it.
-                for (int k = k_lo; f.col_box[ci] && k <= k_hi && open.n > 0; ++k) {
-                    const Cell *cells = f.cells[k];
-                    if (!cells || !cells[ci].box || cells[ci].box >= f.nboxsets)
-                        continue;
-                    const BoxSet &set = f.boxsets[cells[ci].box];
+                // Shapes standing inside the tile (furniture, battlements, stairs):
+                // blocks the ray enters and leaves somewhere between the tile's
+                // edges. They are drawn before the tile's own floor: seen from the
+                // eye, the floor in front of a block lies below it on the screen
+                // and the floor behind it is hidden by it. The blocks of all the
+                // tile's levels are tested together: the steps of a spiral stair
+                // reach under the floor of their level, among those of the level below.
+                if (f.col_box[ci] && open.n > 0) {
                     struct BoxHit {
                         float tin, tout;
                         const Box *box;
-                        int side;
+                        int side;       // the ray comes in through a side facing x (0), y (1), or of a round piece (2)
+                        float nu, nv;   // the outward normal of that side of a round piece
+                        int k;
                     };
-                    BoxHit hits[16];
+                    constexpr int MAX_HITS = 64;
+                    BoxHit hits[MAX_HITS];
                     int nh = 0;
-                    for (int i = 0; i < set.n; ++i) {
-                        const Box &b = set.b[i];
-                        float ax = -1e30f, bx = 1e30f, ay = -1e30f, by = 1e30f;
-                        if (rx != 0) {
-                            const float t0 = (mapx + b.u0 - f.px) / rx, t1 = (mapx + b.u1 - f.px) / rx;
-                            ax = std::min(t0, t1);
-                            bx = std::max(t0, t1);
-                        } else if (f.px < mapx + b.u0 || f.px > mapx + b.u1) {
+                    for (int k = k_lo; k <= k_hi; ++k) {
+                        const Cell *cells = f.cells[k];
+                        if (!cells || !cells[ci].box || cells[ci].box >= f.nboxsets)
                             continue;
+                        const BoxSet &set = f.boxsets[cells[ci].box];
+                        for (int i = 0; i < set.n; ++i) {
+                            const Box &b = set.b[i];
+                            float tin, tout, nu = 0, nv = 0;
+                            int sd;
+                            if (b.round) {
+                                if (!roundClip(b, f.px - mapx, f.py - mapy, rx, ry, tin, tout, nu, nv))
+                                    continue;
+                                sd = 2;
+                            } else {
+                                float ax = -1e30f, bx = 1e30f, ay = -1e30f, by = 1e30f;
+                                if (rx != 0) {
+                                    const float t0 = (mapx + b.u0 - f.px) / rx, t1 = (mapx + b.u1 - f.px) / rx;
+                                    ax = std::min(t0, t1);
+                                    bx = std::max(t0, t1);
+                                } else if (f.px < mapx + b.u0 || f.px > mapx + b.u1) {
+                                    continue;
+                                }
+                                if (ry != 0) {
+                                    const float t0 = (mapy + b.v0 - f.py) / ry, t1 = (mapy + b.v1 - f.py) / ry;
+                                    ay = std::min(t0, t1);
+                                    by = std::max(t0, t1);
+                                } else if (f.py < mapy + b.v0 || f.py > mapy + b.v1) {
+                                    continue;
+                                }
+                                tin = std::max(ax, ay);
+                                tout = std::min(bx, by);
+                                sd = ax > ay ? 0 : 1;
+                            }
+                            if (tout <= 0.02f || tout <= tin)
+                                continue;
+                            if (nh == MAX_HITS && tin >= hits[nh - 1].tin)
+                                continue;
+                            int at = nh < MAX_HITS ? nh++ : nh - 1;      // nearest first
+                            while (at > 0 && hits[at - 1].tin > tin) {
+                                hits[at] = hits[at - 1];
+                                --at;
+                            }
+                            hits[at] = BoxHit{tin, tout, &b, sd, nu, nv, k};
                         }
-                        if (ry != 0) {
-                            const float t0 = (mapy + b.v0 - f.py) / ry, t1 = (mapy + b.v1 - f.py) / ry;
-                            ay = std::min(t0, t1);
-                            by = std::max(t0, t1);
-                        } else if (f.py < mapy + b.v0 || f.py > mapy + b.v1) {
-                            continue;
-                        }
-                        const float tin = std::max(ax, ay), tout = std::min(bx, by);
-                        if (tout <= 0.02f || tout <= tin)
-                            continue;
-                        int at = nh++;      // nearest first
-                        while (at > 0 && hits[at - 1].tin > tin) {
-                            hits[at] = hits[at - 1];
-                            --at;
-                        }
-                        hits[at] = BoxHit{tin, tout, &b, ax > ay ? 0 : 1};
                     }
-                    if (!nh)
-                        continue;
-                    const int tz = f.zlo + k;
-                    const bool lit = tile_lit && tz == f.hl.z;
                     // distance of the tile's middle, where things standing in it are:
                     // the part of a block's top nearer than that hides them
                     const float mid = (mapx + 0.5f - f.px) * f.dirx + (mapy + 0.5f - f.py) * f.diry;
@@ -691,7 +816,7 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
                     float ylo = float(H), yhi = 0;
                     for (int i = 0; i < nh; ++i) {
                         const Box &b = *hits[i].box;
-                        const float h0 = f.zrel[k] + b.z0, h1 = f.zrel[k] + b.z1;
+                        const float h0 = f.zrel[hits[i].k] + b.z0, h1 = f.zrel[hits[i].k] + b.z1;
                         const float in_n = S / std::max(hits[i].tin, NEAR), in_f = S / hits[i].tout;
                         for (const float y : {hz - h1 * in_n, hz - h1 * in_f, hz - h0 * in_n, hz - h0 * in_f}) {
                             ylo = std::min(ylo, y);
@@ -700,10 +825,8 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
                     }
                     const int ya = std::clamp(int(std::floor(ylo)), 0, H);
                     const int yb = std::clamp(int(std::ceil(yhi)) + 1, 0, H);
-                    if (ya >= yb)
-                        continue;
                     int pa[MAX_OPEN + 2], pb[MAX_OPEN + 2];
-                    const int np = open.peek(ya, yb, pa, pb);
+                    const int np = nh && ya < yb ? open.peek(ya, yb, pa, pb) : 0;
                     enum { NONE, SIDE, TOP, UNDER };
                     for (int j = 0; j < np; ++j) {
                         int run = -1, run_box = -1, run_kind = NONE;
@@ -711,6 +834,8 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
                         const auto flush = [&](int y) {
                             if (run < 0)
                                 return;
+                            const int tz = f.zlo + hits[run_box].k;
+                            const bool lit = tile_lit && tz == f.hl.z;
                             const int nv = open.clip(run, y, va, vb);
                             for (int q = 0; q < nv; ++q) {
                                 if (lit)
@@ -727,7 +852,7 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
                             int bi = -1, kind = NONE;
                             for (int i = 0; i < nh; ++i) {
                                 const Box &b = *hits[i].box;
-                                const float h0 = f.zrel[k] + b.z0, h1 = f.zrel[k] + b.z1;
+                                const float h0 = f.zrel[hits[i].k] + b.z0, h1 = f.zrel[hits[i].k] + b.z1;
                                 const bool outside = hits[i].tin > NEAR;
                                 float lo = std::max(hits[i].tin, NEAR), hi = hits[i].tout;
                                 int kd = outside ? SIDE : NONE;
@@ -781,13 +906,51 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
                             const float wx = f.px + best * rx, wy = f.py + best * ry;
                             uint32_t c;
                             float depth;
-                            if (kind == SIDE) {
+                            // the dark line along the edges of a model's faces (Box::edge)
+                            const float bu = wx - mapx, bv = wy - mapy;
+                            const auto edged = [&](uint32_t t, float dist) {
+                                if (dist >= b.edge)
+                                    return t;
+                                constexpr int K = int(EDGE_DARK * 256);
+                                return (t & 0xFF000000u) | ((((t >> 16) & 255) * K >> 8) << 16) |
+                                       ((((t >> 8) & 255) * K >> 8) << 8) | ((t & 255) * K >> 8);
+                            };
+                            if (kind == SIDE && hits[bi].side == 2) {
+                                // a side of a round piece: lit by how it faces, like the
+                                // sides of blocks (those facing x brighter than those facing y)
+                                const Tex &tex = scene.tex.get(b.side);
+                                const float h0 = f.zrel[hits[bi].k] + b.z0, h1 = f.zrel[hits[bi].k] + b.z1;
+                                const float down = std::clamp((h1 - kk * best) / std::max(h1 - h0, 1e-4f), 0.0f, 0.999f);
+                                float along = wy * hits[bi].nu - wx * hits[bi].nv;
+                                along -= std::floor(along);
+                                const int texx = std::min(31, int(along * 32));
+                                const int texy = int(down * (b.z1 - b.z0) * 32) & 31;
+                                depth = hits[bi].tin;
+                                const float dark = 0.8f + 0.2f * std::abs(hits[bi].nu);
+                                const Shade shade(f.fog, int(shade_factor(depth) * dark));
+                                float dist = 1e9f;
+                                if (b.edge > 0) {
+                                    // to its top and bottom, and to the creased corners at its ends
+                                    const float hit = kk * best;
+                                    dist = std::min(h1 - hit, hit - h0);
+                                    for (int k = 0; k < b.round; ++k)
+                                        if (b.rnu[k] == hits[bi].nu && b.rnv[k] == hits[bi].nv) {
+                                            const int j = k + 1 < b.round ? k + 1 : 0;
+                                            if (b.sharp & (1u << k))
+                                                dist = std::min(dist, std::hypot(bu - b.ru[k], bv - b.rv[k]));
+                                            if (b.sharp & (1u << j))
+                                                dist = std::min(dist, std::hypot(bu - b.ru[j], bv - b.rv[j]));
+                                            break;
+                                        }
+                                }
+                                c = shade(edged(tex.px[(texy << 5) + texx], dist));
+                            } else if (kind == SIDE) {
                                 const int side_in = hits[bi].side;
                                 // which side of the block it is: a cabinet has its doors on one
                                 const uint8_t bit = side_in == 0 ? (rx > 0 ? FACE_W : FACE_E) : (ry > 0 ? FACE_N : FACE_S);
                                 const bool pictured = b.face && (b.face_sides & bit);
                                 const Tex &tex = scene.tex.get(pictured ? b.face : b.side);
-                                const float h0 = f.zrel[k] + b.z0, h1 = f.zrel[k] + b.z1;
+                                const float h0 = f.zrel[hits[bi].k] + b.z0, h1 = f.zrel[hits[bi].k] + b.z1;
                                 const float down = std::clamp((h1 - kk * best) / std::max(h1 - h0, 1e-4f), 0.0f, 0.999f);
                                 int texx, texy;
                                 if (tex.stretch) {
@@ -806,10 +969,16 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
                                 }
                                 depth = hits[bi].tin;
                                 const Shade shade(f.fog, int(shade_factor(depth) * (side_in && !pictured ? 0.8f : 1.0f)));
-                                c = shade(tex.px[(texy << 5) + texx]);
+                                float dist = 1e9f;
+                                if (b.edge > 0 && !pictured) {
+                                    const float hit = kk * best, at = side_in == 1 ? bu : bv;
+                                    const float a0 = side_in == 1 ? b.u0 : b.v0, a1 = side_in == 1 ? b.u1 : b.v1;
+                                    dist = std::min({h1 - hit, hit - h0, at - a0, a1 - at});
+                                }
+                                c = shade(edged(tex.px[(texy << 5) + texx], dist));
                             } else {
                                 const bool top = kind == TOP;
-                                const Tex &tex = scene.tex.get(top ? b.top : b.side);
+                                const Tex &tex = scene.tex.get(top ? b.top : (b.under ? b.under : b.side));
                                 int u, v;
                                 if (tex.stretch) {
                                     u = std::clamp(int((wx - mapx - b.u0) * 32.0f / std::max(b.u1 - b.u0, 1e-3f)), 0, 31);
@@ -822,7 +991,16 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
                                 // near part in front of what stands inside the block
                                 depth = hits[bi].tout;
                                 const Shade shade(f.fog, int(shade_factor(depth) * (top ? 1.0f : 0.6f)));
-                                c = shade(tex.px[(v << 5) | u]);
+                                float dist = 1e9f;
+                                if (b.edge > 0) {
+                                    if (b.round) {
+                                        for (int k = 0; k < b.round; ++k)
+                                            dist = std::min(dist, -(b.rnu[k] * (bu - b.ru[k]) + b.rnv[k] * (bv - b.rv[k])));
+                                    } else {
+                                        dist = std::min({bu - b.u0, b.u1 - bu, bv - b.v0, b.v1 - bv});
+                                    }
+                                }
+                                c = shade(edged(tex.px[(v << 5) | u], dist));
                                 if (best < mid) {
                                     depth = best;
                                     kind += 8;
@@ -861,8 +1039,11 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
                             if (c.solid) {
                                 // top of a block that has no known floor above it
                                 if (!above || !(above->solid || above->flr || above->half))
-                                    surface(h1, c.solid, true, 1.0f, tz);
+                                    surface(h1, c.top ? c.top : c.solid, true, 1.0f, tz);
                             } else {
+                                // (first: what lies under it is drawn after it)
+                                if (c.water && !(c.flags & CELL_UNDER))
+                                    water_top(c, h0 + water_height(c) * LEVEL_H, tz);
                                 if (c.ramp) {
                                     if (c.top)
                                         slope(c, h0, tz);
@@ -878,7 +1059,7 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
                                 // (ceilings all use the grey roof texture, not the
                                 // pattern of the floor or wall above)
                                 if (below && !below->solid)
-                                    surface(h0, roof ? roof : c.solid, false, 0.7f, tz);
+                                    surface(h0, c.half ? c.half : roof ? roof : c.solid, false, 0.7f, tz);
                             } else {
                                 if (c.flr && (!below || !below->solid))
                                     surface(h0, roof ? roof : c.flr, false, 0.7f, tz);
@@ -911,16 +1092,95 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
                 break;
         }
 
+        // The land beyond the map, in the rows still empty, where the column
+        // looks out under the sky: a march along the ray over its heights,
+        // near to far, each step filling the rows between where its ground
+        // shows and what nearer ground already covers. Its depth is kept per
+        // pixel, for the stand-ins for trees on it.
+        if (f.far && col_sky && open.n > 0) {
+            const auto leave = [](float p, float r, float hi) {
+                if (p < 0 || p > hi)
+                    return 0.0f;
+                return r > 0 ? (hi - p) / r : r < 0 ? -p / r : 1e30f;
+            };
+            float t = std::max(0.5f, std::min({f.max_d, leave(f.px, rx, float(f.map_w)), leave(f.py, ry, float(f.map_h))}));
+            const OpenList before = open;
+            float ytop = float(H);
+            const float top = f.far->top;
+            float *depth_col = far_depth_.data() + size_t(sx) * H;
+            int prev_id = 0;
+            float prev_h = -1e30f;
+            while (t < f.view_dist && open.n > 0 && ytop > 0) {
+                float h;
+                uint32_t top_c, side_c;
+                int id;
+                if (f.far->sample(f.px + t * rx, f.py + t * ry, h, top_c, side_c, id)) {
+                    // stepping onto a higher block, what shows first is its side
+                    const bool side_on = prev_h > -1e29f && id != prev_id && h > prev_h + 0.01f;
+                    prev_id = id;
+                    prev_h = h;
+                    const float yy = hz + (f.eye - h) * S / t;
+                    if (yy < ytop) {
+                        const int a = std::max(0, int(yy + 0.5f)), e = std::min(H, int(ytop + 0.5f));
+                        if (a < e) {
+                            const int nv = open.clip(a, e, va, vb);
+                            if (nv > 0) {
+                                const uint32_t c = side_on ? side_c : top_c;
+                                const uint32_t shaded = Shade(f.fog, shade_factor(t))(c);
+                                for (int v = 0; v < nv; ++v)
+                                    for (int y = va[v]; y < vb[v]; ++y) {
+                                        col[y] = shaded;
+                                        depth_col[y] = t;
+                                    }
+                            }
+                        }
+                        ytop = yy;
+                    }
+                }
+                // Once the highest land there is would show below what is
+                // drawn, nothing farther can show: it only sinks towards the horizon.
+                if (top >= f.eye && hz + (f.eye - top) * S / t >= ytop)
+                    break;
+                t += std::max(0.5f, t * 0.006f);
+            }
+            const int far_top = std::clamp(int(ytop + 0.5f), 0, H);
+            for (int i = 0; i < before.n; ++i) {
+                const int a = std::max(before.a[i], far_top), e = before.b[i];
+                if (a < e)
+                    record(a, e, FAR_DEPTH, -2, -2, -2);
+            }
+        }
+
         // whatever is still empty is sky above the horizon and haze below it
         for (int i = 0; i < open.n; ++i) {
             const int s = open.a[i], e = open.b[i];
             const int sky_end = col_sky ? std::min(e, f.hzi) : s;
             int y = s;
+            if (f.sky && y < sky_end) {
+                // the direction of each pixel: the column's way across, and up by the row
+                const float a = (sx + 0.5f - f.W * 0.5f) / f.S;
+                f.sky->column(f.dirx, f.diry, f.rgtx, f.rgty, a, (f.hz - (y + 0.5f)) / f.S, -1 / f.S, sky_end - y,
+                              col + y);
+                y = sky_end;
+            }
             for (; y < sky_end; ++y)
                 col[y] = sky_row_[y];
             for (; y < e; ++y)
                 col[y] = f.fog;
             record(s, e, FAR_DEPTH, -1, -1, -1);
+        }
+
+        // the water over what lies under it
+        for (int y = veil_lo; y < veil_hi; ++y) {
+            const uint32_t w = veil[y];
+            if (!w)
+                continue;
+            veil[y] = 0;
+            const uint32_t a = uint32_t(px_a(w)) + 1, ia = 257 - a;
+            const uint32_t c = col[y];
+            const uint32_t rb = (((c & 0x00FF00FFu) * ia + (w & 0x00FF00FFu) * a) >> 8) & 0x00FF00FFu;
+            const uint32_t g = (((c & 0x0000FF00u) * ia + (w & 0x0000FF00u) * a) >> 8) & 0x0000FF00u;
+            col[y] = 0xFF000000u | rb | g;
         }
         span_count_[sx] = uint8_t(nspans);
         hit_count_[sx] = 0;
@@ -928,17 +1188,18 @@ void Renderer::renderColumns(const Frame &f, int x0, int x1) {
     }
 }
 
-// The creature under the pointer: a faint disc on the ground around its feet in
-// its colour (how it stands to you) and, while it walks, an arrow from the disc
-// towards the tile it steps to next. Drawn before the creature, over the ground.
+// A creature in a conflict, and the one under the pointer: a faint disc on the
+// ground around its feet in its colour and, for the pointed-at one while it
+// walks, an arrow from the disc towards the tile it steps to next. Drawn before
+// the creature, over the ground.
 template <class MaskedFn>
-void Renderer::draw_ring(const Frame &f, const Billboard &b, float bill_depth, int x0, int x1,
+void Renderer::draw_ring(const Frame &f, const Billboard &b, float bill_depth, int x0, int x1, bool with_arrow,
                          MaskedFn &draw_masked_until) {
     const int W = f.W, H = f.H;
     constexpr float R = 0.36f, RIM = 0.29f, A0 = R * 0.95f, A1 = R + 0.42f;
     float ux = b.move_dx, uy = b.move_dy;
     const float ul = std::sqrt(ux * ux + uy * uy);
-    const bool arrow = ul > 0;
+    const bool arrow = with_arrow && ul > 0;
     if (arrow) {
         ux /= ul;
         uy /= ul;
@@ -1063,8 +1324,9 @@ void Renderer::renderBillboards(const Frame &f, int x0, int x1) {
         const Billboard &b = *f.bills[bi];
         const Sprite &sp = *b.sprite;
         const float depth = f.bill_depth[bi];
-        if (b.ring && f.hl.unit_id >= 0 && b.unit_id == f.hl.unit_id)
-            draw_ring(f, b, depth, x0, x1, draw_masked_until);
+        const bool pointed = f.hl.unit_id >= 0 && b.unit_id == f.hl.unit_id;
+        if (b.ring && (b.fight || pointed))
+            draw_ring(f, b, depth, x0, x1, pointed, draw_masked_until);
         const float inv = f.S / depth;
         const float pps = inv * b.scale * THING_SCALE / TEX;   // screen pixels per sprite pixel
         const float left = W / 2.0f + f.bill_lat[bi] * inv - b.anchor_px * pps;
@@ -1081,8 +1343,7 @@ void Renderer::renderBillboards(const Frame &f, int x0, int x1) {
         if (cx0 >= cx1 || cy0 >= cy1)
             continue;
 
-        float t = std::min(depth * inv_view, 1.0f);
-        const Shade shade(f.fog, int(256 * (1 - 0.97f * t * std::sqrt(std::sqrt(t)))));
+        const Shade shade(f.fog, int(256 * (1 - haze_at(depth * inv_view, f.view_dist, f.weather_haze, f.weather_reach))));
         const float inv_pps = 1.0f / pps;
         const int ystep = int(inv_pps * 65536.0f);
         const bool lit = f.hl.valid() &&
@@ -1110,11 +1371,14 @@ void Renderer::renderBillboards(const Frame &f, int x0, int x1) {
                 if (a >= e)
                     continue;
                 int tpos = int(std::floor((a + 0.5f - topy) * inv_pps * 65536.0f));
+                const float *far_d = s.tz == -2 ? far_depth_.data() + size_t(sx) * H : nullptr;
                 for (int y = a; y < e; ++y) {
                     const int ty = tpos >> 16;
                     tpos += ystep;
                     if (ty < sp.y0 - edge || ty >= sp.y1)
                         continue;
+                    if (far_d && depth >= far_d[y])
+                        continue;   // behind the far land's ground there
                     if (solid(tx, ty)) {
                         const uint32_t c = sp.px[size_t(ty) * sp.w + tx];
                         col[y] = lit ? brighten(shade(c)) : shade(c);

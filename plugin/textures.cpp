@@ -87,7 +87,10 @@ uint8_t pattern_pixel(Pattern p, int x, int y) {
         else if (in_y == 7 || in_x == 15) l -= 16;               // shaded edge
         break;
     }
-    case Pattern::Smooth: {
+    case Pattern::Smooth:
+        l = 120 + 10 * noise(x, y, 16, 21) + 5 * noise(x, y, 4, 22) + 4 * grain;
+        break;
+    case Pattern::Slabs: {
         const int in_x = x % 16, in_y = y % 16;
         l = 124 + 10 * noise(x, y, 8, 21) + 5 * grain;
         if (in_y == 0 || in_x == 0) l = 92;
@@ -246,6 +249,8 @@ enum : uint64_t {
     KIND_FRONT = 12ull << 56,
     KIND_SPRITE_CUT = 13ull << 56,
     KIND_OVER = 14ull << 56,
+    KIND_ENGRAVED = 15ull << 56,
+    KIND_IMAGE = 16ull << 56,
 };
 
 inline uint64_t key_of(uint64_t kind, int32_t a, int32_t b) {
@@ -268,6 +273,10 @@ void TextureStore::clear() {
     colors_.clear();
     is_material_.clear();
     bare_.clear();
+    holed_.clear();
+    fringed_.clear();
+    unfringed_.clear();
+    water_.clear();
     for (auto &s : specials_)
         s = 0;
 }
@@ -317,6 +326,70 @@ bool TextureStore::readSprite(int32_t texpos, uint32_t *out) {
                 v = (a << 24) | (((v >> bs) & 255) << 16) | (((v >> gs) & 255) << 8) | ((v >> rs) & 255);
             }
             out[y * TEX + x] = v;
+        }
+    }
+    return true;
+}
+
+bool TextureStore::readNative(int32_t texpos, std::vector<uint32_t> &out, int &w, int &h) {
+    if (!enabler || texpos <= 0 || size_t(texpos) >= enabler->textures.raws.size())
+        return false;
+    auto surf = static_cast<SDL_Surface *>(enabler->textures.raws[texpos]);
+    if (!surf || !surf->pixels || !surf->format || surf->w < 1 || surf->h < 1 || surf->w > 512 ||
+        surf->h > 512 || surf->format->BytesPerPixel != 4)
+        return false;
+    const SDL_PixelFormat *fmt = surf->format;
+    const int rs = mask_shift(fmt->Rmask), gs = mask_shift(fmt->Gmask), bs = mask_shift(fmt->Bmask);
+    const int as = mask_shift(fmt->Amask);
+    if (rs < 0 || gs < 0 || bs < 0)
+        return false;
+    w = surf->w;
+    h = surf->h;
+    out.resize(size_t(w) * h);
+    const auto base = static_cast<const uint8_t *>(surf->pixels);
+    for (int y = 0; y < h; ++y) {
+        const auto row = reinterpret_cast<const uint32_t *>(base + y * surf->pitch);
+        for (int x = 0; x < w; ++x) {
+            const uint32_t v = row[x];
+            const uint32_t a = as >= 0 ? ((v >> as) & 255) : 255;
+            out[size_t(y) * w + x] = (a << 24) | (((v >> bs) & 255) << 16) | (((v >> gs) & 255) << 8) | ((v >> rs) & 255);
+        }
+    }
+    return true;
+}
+
+bool TextureStore::readSmooth(int32_t texpos, uint32_t *out) {
+    if (!enabler || texpos <= 0 || size_t(texpos) >= enabler->textures.raws.size())
+        return false;
+    auto surf = static_cast<SDL_Surface *>(enabler->textures.raws[texpos]);
+    if (!surf || !surf->pixels || !surf->format || surf->w <= TEX || surf->h <= TEX || surf->w > 512 ||
+        surf->h > 512 || surf->format->BytesPerPixel != 4)
+        return readSprite(texpos, out);
+    const SDL_PixelFormat *fmt = surf->format;
+    const int rs = mask_shift(fmt->Rmask), gs = mask_shift(fmt->Gmask), bs = mask_shift(fmt->Bmask);
+    const int as = mask_shift(fmt->Amask);
+    if (rs < 0 || gs < 0 || bs < 0)
+        return false;
+    const auto base = static_cast<const uint8_t *>(surf->pixels);
+    for (int y = 0; y < TEX; ++y) {
+        const int sy0 = y * surf->h / TEX, sy1 = std::max(sy0 + 1, (y + 1) * surf->h / TEX);
+        for (int x = 0; x < TEX; ++x) {
+            const int sx0 = x * surf->w / TEX, sx1 = std::max(sx0 + 1, (x + 1) * surf->w / TEX);
+            // colours count by how solid they are, so see-through pixels do not darken an edge
+            uint32_t r = 0, g = 0, b = 0, a = 0;
+            for (int sy = sy0; sy < sy1; ++sy) {
+                const auto row = reinterpret_cast<const uint32_t *>(base + sy * surf->pitch);
+                for (int sx = sx0; sx < sx1; ++sx) {
+                    const uint32_t v = row[sx];
+                    const uint32_t pa = as >= 0 ? ((v >> as) & 255) : 255;
+                    r += ((v >> rs) & 255) * pa;
+                    g += ((v >> gs) & 255) * pa;
+                    b += ((v >> bs) & 255) * pa;
+                    a += pa;
+                }
+            }
+            const uint32_t count = uint32_t((sy1 - sy0) * (sx1 - sx0));
+            out[y * TEX + x] = a ? ((a / count) << 24) | ((b / a) << 16) | ((g / a) << 8) | (r / a) : 0;
         }
     }
     return true;
@@ -391,6 +464,17 @@ uint16_t TextureStore::special(Special which) {
     }
     specials_[i] = add(std::move(t), 0);
     return specials_[i];
+}
+
+uint16_t TextureStore::image(uint32_t serial, const uint32_t *px, uint32_t tint) {
+    const uint64_t key = key_of(KIND_IMAGE, int32_t(serial), int32_t(tint & 0x00FFFFFFu));
+    if (const uint16_t id = find(key))
+        return id;
+    auto t = std::make_unique<Tex>();
+    const int tr = tint ? px_r(tint) : 255, tg = tint ? px_g(tint) : 255, tb = tint ? px_b(tint) : 255;
+    for (int i = 0; i < TEXPIX; ++i)
+        t->px[i] = rgb(px_r(px[i]) * tr / 255, px_g(px[i]) * tg / 255, px_b(px[i]) * tb / 255);
+    return add(std::move(t), key);
 }
 
 uint16_t TextureStore::material(Pattern pattern, uint32_t color) {
@@ -602,6 +686,93 @@ uint16_t TextureStore::spriteEmblem(int32_t tp) {
     return add(std::move(t), key);
 }
 
+uint16_t TextureStore::engraved(uint32_t color, int32_t tp) {
+    const int r = px_r(color) & ~3, g = px_g(color) & ~3, b = px_b(color) & ~3;
+    const uint64_t key = key_of(KIND_ENGRAVED, (r << 16) | (g << 8) | b, tp);
+    if (const uint16_t id = find(key))
+        return id;
+    // brightness, 128 = the stone's own colour; light comes from the upper left
+    float l[TEXPIX];
+    const uint8_t *smooth = pattern_map(Pattern::Smooth);
+    for (int i = 0; i < TEXPIX; ++i)
+        l[i] = smooth[i];
+    // a groove all round, two pixels in from the edge of the face
+    for (int y = 0; y < TEX; ++y)
+        for (int x = 0; x < TEX; ++x) {
+            const int d = std::min(std::min(x, y), std::min(TEX - 1 - x, TEX - 1 - y));
+            float &v = l[y * TEX + x];
+            if (d == 1) v += 8;
+            else if (d == 2) v = 84;
+            else if (d == 3) v -= 10;
+        }
+    // the picture, carved in relief: only its outline and its light and dark
+    // are kept, so a creature's or an item's sprite reads as a carving in the stone
+    uint32_t raw[TEXPIX];
+    if (tp && readSprite(tp, raw)) {
+        int x0 = TEX, y0 = TEX, x1 = 0, y1 = 0;
+        float lo = 1, hi = 0;
+        const auto lum = [](uint32_t c) { return (0.3f * px_r(c) + 0.59f * px_g(c) + 0.11f * px_b(c)) / 255.0f; };
+        for (int y = 0; y < TEX; ++y)
+            for (int x = 0; x < TEX; ++x) {
+                const uint32_t c = raw[y * TEX + x];
+                if (!opaque(c))
+                    continue;
+                x0 = std::min(x0, x);
+                x1 = std::max(x1, x + 1);
+                y0 = std::min(y0, y);
+                y1 = std::max(y1, y + 1);
+                lo = std::min(lo, lum(c));
+                hi = std::max(hi, lum(c));
+            }
+        if (x1 > x0 && y1 > y0) {
+            // as large as fits inside the groove, keeping its proportions
+            const int in0 = 5, in = TEX - 2 * in0;
+            const int sw = x1 - x0, sh = y1 - y0;
+            const float scale = std::min(float(in) / sw, float(in) / sh);
+            const int dw = std::max(1, int(sw * scale + 0.5f)), dh = std::max(1, int(sh * scale + 0.5f));
+            const int ox = in0 + (in - dw) / 2, oy = in0 + (in - dh) / 2;
+            bool mask[TEXPIX] = {};
+            float shade[TEXPIX] = {};
+            for (int y = 0; y < dh; ++y)
+                for (int x = 0; x < dw; ++x) {
+                    const int sx = x0 + std::min(sw - 1, int((x + 0.5f) / scale));
+                    const int sy = y0 + std::min(sh - 1, int((y + 0.5f) / scale));
+                    const uint32_t c = raw[sy * TEX + sx];
+                    if (!opaque(c))
+                        continue;
+                    const int i = (oy + y) * TEX + ox + x;
+                    mask[i] = true;
+                    shade[i] = hi > lo + 0.05f ? (lum(c) - lo) / (hi - lo) : 0.5f;
+                }
+            const auto in_mask = [&](int x, int y) {
+                return x >= 0 && y >= 0 && x < TEX && y < TEX && mask[y * TEX + x];
+            };
+            for (int y = 4; y < TEX - 4; ++y)
+                for (int x = 4; x < TEX - 4; ++x) {
+                    const int i = y * TEX + x;
+                    float &v = l[i];
+                    if (mask[i]) {
+                        // the raised figure: its own light and dark, toned down
+                        v = 104 + 36 * shade[i] + 0.15f * (smooth[i] - 120);
+                        if (!in_mask(x - 1, y) || !in_mask(x, y - 1)) v += 16;        // lit rim
+                        else if (!in_mask(x + 1, y) || !in_mask(x, y + 1)) v -= 14;   // shaded rim
+                    } else {
+                        // the ground cut back around the figure, in its shadow below right
+                        v -= 8;
+                        if (in_mask(x - 1, y) || in_mask(x, y - 1) || in_mask(x - 1, y - 1)) v -= 16;
+                    }
+                }
+        }
+    }
+    auto t = std::make_unique<Tex>();
+    for (int i = 0; i < TEXPIX; ++i) {
+        const float v = std::clamp(l[i], 0.0f, 255.0f);
+        t->px[i] = rgb(std::min(255, int(r * v / 128)), std::min(255, int(g * v / 128)), std::min(255, int(b * v / 128)));
+    }
+    t->stretch = true;
+    return add(std::move(t), key);
+}
+
 uint16_t TextureStore::furnitureFront(int32_t tp, int kind) {
     const uint64_t key = key_of(KIND_FRONT, tp, kind);
     const auto it = index_.find(key);
@@ -780,8 +951,290 @@ uint16_t TextureStore::over(uint16_t base, int32_t tp) {
     for (int i = 0; i < TEXPIX; ++i)
         t->px[i] |= 0xFF000000u;
     const uint16_t id = add(std::move(t), key);
+    // (layers laid over layers: bare() is the texture under all of them)
     if (id != base)
-        bare_[id] = base;
+        bare_[id] = bare(base);
+    return id;
+}
+
+uint16_t TextureStore::water(int32_t depth_tp, const int32_t rim[8], uint8_t land, float opacity,
+                             const int32_t *waves, int frames) {
+    if (!waves || frames < 1)
+        frames = 1;
+    uint64_t key = 1469598103934665603ull;
+    const auto mixin = [&](uint64_t v) { key = (key ^ v) * 1099511628211ull; };
+    mixin(uint32_t(depth_tp));
+    mixin(land);
+    mixin(uint32_t(opacity * 1000.0f + 0.5f));
+    for (int i = 0; i < 8; ++i)
+        mixin(uint32_t(rim[i]));
+    mixin(uint32_t(frames));
+    if (waves)
+        mixin(uint32_t(waves[0]));
+    if (const auto it = water_.find(key); it != water_.end())
+        return it->second;
+    if (texs_.size() + frames >= 65535)
+        return specials_[0];
+
+    // the water itself: colour and how solid each pixel is (0..1)
+    float cr[TEXPIX], cg[TEXPIX], cb[TEXPIX], ca[TEXPIX];
+    {
+        uint32_t raw[TEXPIX];
+        if (!readSprite(depth_tp, raw)) {
+            Tex t;
+            water_pixels(t);
+            std::copy(t.px, t.px + TEXPIX, raw);
+        }
+        for (int i = 0; i < TEXPIX; ++i) {
+            cr[i] = float(px_r(raw[i]));
+            cg[i] = float(px_g(raw[i]));
+            cb[i] = float(px_b(raw[i]));
+            ca[i] = px_a(raw[i]) / 255.0f * opacity;
+        }
+    }
+    // a picture laid over it, as the game would lay it over the water
+    const auto lay = [&](const uint32_t *src, float *r, float *g, float *b, float *a) {
+        for (int i = 0; i < TEXPIX; ++i) {
+            const float sa = px_a(src[i]) / 255.0f;
+            if (sa <= 0)
+                continue;
+            const float na = sa + a[i] * (1 - sa);
+            r[i] = (px_r(src[i]) * sa + r[i] * a[i] * (1 - sa)) / na;
+            g[i] = (px_g(src[i]) * sa + g[i] * a[i] * (1 - sa)) / na;
+            b[i] = (px_b(src[i]) * sa + b[i] * a[i] * (1 - sa)) / na;
+            a[i] = na;
+        }
+    };
+    uint32_t pic[TEXPIX];
+    for (int i = 0; i < 8; ++i)
+        if (rim[i] > 0 && readSprite(rim[i], pic))
+            lay(pic, cr, cg, cb, ca);
+
+    // Towards land the edge thins out in an ordered dither: fewer and fewer
+    // pixels of water the nearer the edge. A 4 x 4 pattern divides the tile, so
+    // the dither runs on unbroken from tile to tile.
+    static const int BAYER[4][4] = {{0, 8, 2, 10}, {12, 4, 14, 6}, {3, 11, 1, 9}, {15, 7, 13, 5}};
+    constexpr float DITHER = 7;   // pixels
+    float keep[TEXPIX];
+    for (int y = 0; y < TEX; ++y)
+        for (int x = 0; x < TEX; ++x) {
+            float d = 1e9f;
+            if (land & 1) d = std::min(d, y + 0.5f);
+            if (land & 2) d = std::min(d, TEX - y - 0.5f);
+            if (land & 4) d = std::min(d, x + 0.5f);
+            if (land & 8) d = std::min(d, TEX - x - 0.5f);
+            const auto corner = [&](int bit, float cx, float cy) {
+                if (land & bit)
+                    d = std::min(d, std::hypot(x + 0.5f - cx, y + 0.5f - cy));
+            };
+            corner(16, 0, 0);
+            corner(32, float(TEX), 0);
+            corner(64, 0, float(TEX));
+            corner(128, float(TEX), float(TEX));
+            keep[y * TEX + x] = d >= DITHER || BAYER[y & 3][x & 3] < int(d / DITHER * 16.0f) ? 1.0f : 0.0f;
+        }
+
+    uint16_t first = 0;
+    for (int f = 0; f < frames; ++f) {
+        float r[TEXPIX], g[TEXPIX], b[TEXPIX], a[TEXPIX];
+        std::copy(cr, cr + TEXPIX, r);
+        std::copy(cg, cg + TEXPIX, g);
+        std::copy(cb, cb + TEXPIX, b);
+        std::copy(ca, ca + TEXPIX, a);
+        if (waves && waves[f] > 0 && readSprite(waves[f], pic))
+            lay(pic, r, g, b, a);
+        auto t = std::make_unique<Tex>();
+        for (int i = 0; i < TEXPIX; ++i) {
+            const int al = int(a[i] * keep[i] * 255.0f + 0.5f);
+            t->px[i] = al <= 0 ? 0u
+                               : (uint32_t(std::min(al, 255)) << 24) | (uint32_t(std::clamp(int(b[i] + 0.5f), 0, 255)) << 16) |
+                                     (uint32_t(std::clamp(int(g[i] + 0.5f), 0, 255)) << 8) |
+                                     uint32_t(std::clamp(int(r[i] + 0.5f), 0, 255));
+        }
+        const uint16_t id = add(std::move(t), 0);
+        if (f == 0)
+            first = id;
+    }
+    water_[key] = first;
+    return first;
+}
+
+namespace {
+// Smooth noise over the ground in texture pixels (32 a tile), repeating every
+// 8 tiles: the same everywhere a tile's holes are worked out, so they meet up
+// at tile borders. 0..1, mostly 0.25..0.75.
+float hole_noise(int px, int py) {
+    constexpr int PERIOD = 8 * TEX;
+    const auto lattice = [](int i, int j, int cells) {
+        i = ((i % cells) + cells) % cells;
+        j = ((j % cells) + cells) % cells;
+        uint32_t h = uint32_t(i) * 374761393u + uint32_t(j) * 668265263u + uint32_t(cells) * 2246822519u;
+        h = (h ^ (h >> 13)) * 1274126177u;
+        return float((h ^ (h >> 16)) & 0xFFFF) / 65535.0f;
+    };
+    const auto octave = [&](int cell) {
+        const int cells = PERIOD / cell;
+        const float fx = (px + 0.5f) / cell, fy = (py + 0.5f) / cell;
+        const int ix = int(std::floor(fx)), iy = int(std::floor(fy));
+        float tx = fx - ix, ty = fy - iy;
+        tx = tx * tx * (3 - 2 * tx);
+        ty = ty * ty * (3 - 2 * ty);
+        const float a = lattice(ix, iy, cells), b = lattice(ix + 1, iy, cells);
+        const float c = lattice(ix, iy + 1, cells), d = lattice(ix + 1, iy + 1, cells);
+        return (a + (b - a) * tx) + ((c + (d - c) * tx) - (a + (b - a) * tx)) * ty;
+    };
+    return (octave(8) + 0.45f * octave(4) + 0.2f * octave(2)) / 1.65f;
+}
+} // namespace
+
+uint16_t TextureStore::overHoled(uint16_t base, int32_t tp, uint32_t holes) {
+    if (!(holes & 0xFFFF))
+        return over(base, tp);
+    if (!base || !tp || base >= texs_.size() || !texs_[base])
+        return base;
+    const uint64_t key = (uint64_t(base) << 48) | (uint64_t(holes & 0x3FFFFF) << 26) | (uint32_t(tp) & 0x3FFFFFF);
+    const auto it = holed_.find(key);
+    if (it != holed_.end())
+        return it->second;
+    uint32_t raw[TEXPIX];
+    if (!readSprite(tp, raw)) {
+        holed_[key] = base;
+        return base;
+    }
+    const float nw = float(holes & 15) / 10, ne = float((holes >> 4) & 15) / 10;
+    const float sw = float((holes >> 8) & 15) / 10, se = float((holes >> 12) & 15) / 10;
+    const int ox = int((holes >> 16) & 7) * TEX, oy = int((holes >> 19) & 7) * TEX;
+    for (int y = 0; y < TEX; ++y)
+        for (int x = 0; x < TEX; ++x) {
+            const float u = (x + 0.5f) / TEX, v = (y + 0.5f) / TEX;
+            const float f = (nw + (ne - nw) * u) + ((sw + (se - sw) * u) - (nw + (ne - nw) * u)) * v;
+            if (f <= 0)
+                continue;
+            // the more there is under it, the more of the picture is open; a
+            // soft rim so the holes do not look cut out
+            const float t = 0.6f * f;
+            const float keep = std::clamp((hole_noise(ox + x, oy + y) - t) / 0.05f, 0.0f, 1.0f);
+            uint32_t &p = raw[y * TEX + x];
+            p = (p & 0x00FFFFFFu) | (uint32_t(px_a(p) * keep + 0.5f) << 24);
+        }
+    auto t = std::make_unique<Tex>(*texs_[base]);
+    blend(t->px, TEX, raw);
+    for (int i = 0; i < TEXPIX; ++i)
+        t->px[i] |= 0xFF000000u;
+    const uint16_t id = add(std::move(t), 0);
+    if (id != base)
+        bare_[id] = bare(base);
+    holed_[key] = id;
+    return id;
+}
+
+namespace {
+uint32_t fringe_hash(uint32_t a, uint32_t b, uint32_t c) {
+    uint32_t h = a * 374761393u + b * 668265263u + c * 2246822519u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    return h ^ (h >> 16);
+}
+
+// how far the ground beside reaches in across a side, at t pixels along it:
+// FRINGE_END at both ends, so neighbouring tiles' lines meet whatever their seed
+constexpr float FRINGE_END = 4.0f;
+float fringe_depth(float t, uint32_t seed) {
+    const auto noise = [&](int cell) {
+        const float f = t / cell;
+        const int i = int(std::floor(f));
+        float k = f - i;
+        k = k * k * (3 - 2 * k);
+        const float a = float(fringe_hash(uint32_t(i), seed, uint32_t(cell)) & 0xFFFF) / 65535.0f;
+        const float b = float(fringe_hash(uint32_t(i + 1), seed, uint32_t(cell)) & 0xFFFF) / 65535.0f;
+        return a + (b - a) * k;
+    };
+    const float n = (noise(8) + 0.5f * noise(4) + 0.25f * noise(2)) / 1.75f;   // 0..1
+    const float rise = std::sin(3.14159265f * t / TEX);
+    return FRINGE_END + rise * (n * 1.5f - 0.45f) * 7.0f;
+}
+} // namespace
+
+uint16_t TextureStore::fringed(uint16_t base, const uint16_t from[8], uint32_t variants) {
+    if (!base || base >= texs_.size() || !texs_[base])
+        return base;
+    std::array<uint16_t, 10> key;
+    key[0] = base;
+    bool any = false;
+    for (int i = 0; i < 8; ++i) {
+        key[1 + i] = from[i] < texs_.size() && texs_[from[i]] && from[i] != base ? from[i] : 0;
+        any |= key[1 + i] != 0;
+    }
+    if (!any)
+        return base;
+    key[9] = uint16_t(variants & 15);
+    const auto it = fringed_.find(key);
+    if (it != fringed_.end())
+        return it->second;
+
+    auto t = std::make_unique<Tex>(*texs_[base]);
+    // which texture each pixel takes (0: its own), and the pixels just outside a
+    // line, darkened a little like the lip of grass over the ground beside it
+    uint16_t take[TEXPIX] = {};
+    bool lip[TEXPIX] = {};
+    for (int side = 0; side < 4; ++side) {
+        const uint16_t src = key[1 + side];
+        if (!src)
+            continue;
+        const uint32_t seed = uint32_t(side) * 2 + ((variants >> side) & 1);
+        for (int y = 0; y < TEX; ++y)
+            for (int x = 0; x < TEX; ++x) {
+                // distance in from the side, and how far along it
+                const float dist = side == 0 ? y + 0.5f : side == 1 ? TEX - y - 0.5f
+                                 : side == 2 ? x + 0.5f : TEX - x - 0.5f;
+                if (dist > 14)
+                    continue;
+                const float along = side < 2 ? x + 0.5f : y + 0.5f;
+                const float depth = fringe_depth(along, seed);
+                const int i = y * TEX + x;
+                if (dist < depth) {
+                    take[i] = src;
+                    continue;
+                }
+                // a few loose tufts beyond the line
+                const float beyond = dist - depth;
+                if (beyond < 2.5f && float(fringe_hash(uint32_t(x), uint32_t(y), seed + 17) & 0xFF) / 255.0f <
+                                         0.3f * (1 - beyond / 2.5f)) {
+                    take[i] = src;
+                    continue;
+                }
+                if (beyond < 1.2f)
+                    lip[i] = true;
+            }
+    }
+    for (int corner = 0; corner < 4; ++corner) {
+        const uint16_t src = key[5 + corner];
+        if (!src)
+            continue;
+        const float cx = (corner & 1) ? TEX : 0, cy = (corner & 2) ? TEX : 0;
+        for (int y = 0; y < TEX; ++y)
+            for (int x = 0; x < TEX; ++x) {
+                const float dx = x + 0.5f - cx, dy = y + 0.5f - cy;
+                const float r = std::sqrt(dx * dx + dy * dy);
+                const int i = y * TEX + x;
+                if (r < FRINGE_END + 1)
+                    take[i] = src;
+                else if (r < FRINGE_END + 2.2f)
+                    lip[i] = true;
+            }
+    }
+    for (int i = 0; i < TEXPIX; ++i) {
+        if (take[i]) {
+            t->px[i] = texs_[take[i]]->px[i] | 0xFF000000u;
+        } else if (lip[i]) {
+            const uint32_t p = t->px[i];
+            const auto dk = [](int v) { return uint32_t(v * 205 / 256); };
+            t->px[i] = (p & 0xFF000000u) | (dk(px_b(p)) << 16) | (dk(px_g(p)) << 8) | dk(px_r(p));
+        }
+    }
+    const uint16_t id = add(std::move(t), 0);
+    if (id != base)
+        unfringed_[id] = base;
+    fringed_[key] = id;
     return id;
 }
 
@@ -910,6 +1363,61 @@ std::shared_ptr<Sprite> TextureStore::rotated(const Sprite &src) {
     s->x1 = src.h - src.y0;
     s->y0 = src.x0;
     s->y1 = src.x1;
+    return s;
+}
+
+std::shared_ptr<Sprite> TextureStore::snowCapped(const Sprite &src, float depth, uint32_t seed) {
+    if (src.empty())
+        return nullptr;
+    auto s = std::make_shared<Sprite>(src);
+    const int H = src.y1 - src.y0;
+    const float unit = std::max(1.0f, src.h / 32.0f);   // one pixel of the game's 32 pixel picture
+    const auto at = [&](int x, int y) -> uint32_t & { return s->px[size_t(y) * s->w + x]; };
+    const auto solid = [&](int x, int y) {
+        return x >= 0 && y >= 0 && x < src.w && y < src.h && px_a(src.px[size_t(y) * src.w + x]) >= 128;
+    };
+    const auto hash = [](uint32_t v) {
+        v ^= v >> 16; v *= 0x7feb352dU; v ^= v >> 15; v *= 0x846ca68bU; v ^= v >> 16;
+        return v;
+    };
+    // The snow's lower edge: a line across the picture that rises and falls by a
+    // pixel or two from one point to the next (a point every 4 pixels), so the
+    // plant looks snowed on rather than cut in two colours.
+    const float step = 4 * unit, amp = std::max(unit, H * 0.09f);
+    const float base = src.y0 + std::max(2 * unit, H * depth);
+    const auto bump = [&](int i) { return (float(hash(seed * 977u + uint32_t(i)) & 255) / 255.0f * 2 - 1) * amp; };
+    // the upward-facing edges catch snow too, but only in the upper part
+    const float edge_limit = src.y0 + H * std::min(0.85f, depth + 0.3f);
+    const int edge_px = std::max(1, int(unit + 0.5f));
+
+    const auto paint = [&](uint32_t &c) {
+        const int lum = (px_r(c) * 3 + px_g(c) * 6 + px_b(c)) / 10;
+        // the picture's shading shows through; its dark outline stays a shadowed grey
+        const float f = lum < 48 ? 0.58f : 0.74f + 0.26f * std::min(1.0f, lum / 200.0f);
+        c = rgb(int(234 * f), int(240 * f), std::min(255, int(250 * f + (1 - f) * 40)));
+    };
+    for (int x = src.x0; x < src.x1; ++x) {
+        const float t = x / step;
+        const int i = int(std::floor(t));
+        float u = t - i;
+        u = u * u * (3 - 2 * u);
+        const float line = base + bump(i) + (bump(i + 1) - bump(i)) * u;
+        int exposed = 0;   // pixels left to paint below an upward-facing edge
+        for (int y = src.y0; y < src.y1; ++y) {
+            if (!solid(x, y)) {
+                exposed = 0;
+                continue;
+            }
+            if (!solid(x, y - 1) && y < edge_limit)
+                exposed = edge_px;
+            // at the line itself every other pixel, a ragged edge
+            const bool under = y < int(line) || (y == int(line) && ((x / edge_px + y / edge_px) & 1));
+            if (under || exposed > 0)
+                paint(at(x, y));
+            if (exposed > 0)
+                --exposed;
+        }
+    }
     return s;
 }
 

@@ -22,7 +22,15 @@
     MSVC 14.x toolsets are binary compatible with each other.
 
 .PARAMETER Install
-    Copy the built plugin to <DF>\hack\plugins afterwards.
+    Install everything afterwards: the plugin into <DF>\hack\plugins, and the
+    scripts and art into the mods folder (install.ps1, which keeps art the
+    player has edited there). With the game running:
+      - at the title menu (no world loaded) the plugin is unloaded, replaced
+        and loaded again;
+      - with a world loaded the plugin is left alone (unloading it then
+        freezes the game) and only the scripts and art are installed; the new
+        plugin needs the title menu or a restart.
+    The game's overlay widgets are reloaded so the scripts take effect at once.
 #>
 param(
     [string]$DFPath = 'C:\Soft\Steam\steamapps\common\Dwarf Fortress',
@@ -86,6 +94,22 @@ if ($text -notmatch 'POSIX::_exit') {
     Set-Content $codegen $text -NoNewline
 }
 
+# The models in media\models are built in as well, for when the player's
+# files are missing or broken. Written only when they changed, so the build
+# stays incremental.
+$models = Get-ChildItem (Join-Path $repo 'media\models') -File |
+    Where-Object { $_.Extension -in '.obj', '.mtl' } | Sort-Object Name
+$inc = "// Written by build.ps1 from media\models; do not edit.`nconst BuiltIn BUILT_IN_MODELS[] = {`n"
+foreach ($m in $models) {
+    $body = (Get-Content $m.FullName -Raw) -replace "`r", ''
+    $inc += "    {`"$($m.Name.ToLower())`", R`"fpvmodel($body)fpvmodel`"},`n"
+}
+$inc += "};`n"
+$incPath = Join-Path $PSScriptRoot 'models_builtin.inc'
+if (-not (Test-Path $incPath) -or (Get-Content $incPath -Raw) -ne $inc) {
+    Set-Content $incPath $inc -NoNewline
+}
+
 # link this folder in as an external plugin
 $external = Join-Path $dfhack 'plugins\external'
 $link = Join-Path $external 'fpview'
@@ -114,8 +138,50 @@ $dll = Get-ChildItem $build -Recurse -Filter 'fpview.plug.dll' | Sort-Object Las
 if (-not $dll) { throw 'fpview.plug.dll was not produced' }
 Write-Host "Built $($dll.FullName)"
 
+# Keep every build's symbols: a crash dump names the plugin by its link time,
+# and by then a later build has replaced the files in the build folder. The
+# folder is named after that link time (local), the newest 30 are kept.
+$symbols = Join-Path $repo '_refs\symbols'
+$keep = Join-Path $symbols $dll.LastWriteTime.ToString('yyyyMMdd-HHmmss')
+if (-not (Test-Path $keep)) {
+    New-Item -ItemType Directory -Path $keep -Force | Out-Null
+    Copy-Item $dll.FullName $keep
+    foreach ($name in 'fpview.pdb', 'fpview.plug.map') {
+        $f = Join-Path $dll.DirectoryName $name
+        if (Test-Path $f) { Copy-Item $f $keep }
+    }
+    Get-ChildItem $symbols -Directory | Sort-Object Name -Descending | Select-Object -Skip 30 |
+        Remove-Item -Recurse -Force
+}
+
 if ($Install) {
     $dest = Join-Path $DFPath 'hack\plugins\fpview.plug.dll'
-    Copy-Item $dll.FullName $dest -Force
-    Write-Host "Installed $dest"
+    $run = Join-Path $DFPath 'hack\dfhack-run.exe'
+    $running = [bool](Get-Process -Name 'Dwarf Fortress' -ErrorAction SilentlyContinue)
+    $world = $false
+    if ($running) {
+        $answer = & $run lua 'print(dfhack.isWorldLoaded())' 2>$null
+        # no answer: take a world to be loaded, the safe side
+        $world = -not ("$answer" -match '^\s*false')
+    }
+    if (-not $running) {
+        Copy-Item $dll.FullName $dest -Force
+        Write-Host "Installed $dest"
+    } elseif (-not $world) {
+        & $run unload fpview | Out-Null
+        try {
+            Copy-Item $dll.FullName $dest -Force
+            Write-Host "Installed $dest (the game is at the title menu: plugin reloaded)"
+        } finally {
+            & $run load fpview | Out-Null
+        }
+    } else {
+        Write-Warning ('A world is loaded: the plugin was not replaced (unloading it now freezes the game). ' +
+            'Go to the title menu and run this again, or restart the game.')
+    }
+    & (Join-Path $repo 'install.ps1') -DFPath $DFPath -NoPlugin
+    if ($running) {
+        & $run lua "require('plugins.overlay').rescan()" | Out-Null
+        Write-Host 'Reloaded the overlay widgets'
+    }
 }

@@ -10,6 +10,7 @@
 #pragma once
 
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -39,12 +40,43 @@ struct Pick {
     bool valid() const { return x >= 0; }
 };
 
+class Sky;
+class Precip;
+struct Weather;
+
+// How much haze lies over something, 0..1. t is its distance as a fraction of
+// the fog distance (what is drawn ends at 1), fog_distance that distance in
+// tiles; the weather's haze comes over it.
+inline float haze_at(float t, float fog_distance, float weather_haze, float weather_reach) {
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    float a = 0.97f * t * std::sqrt(std::sqrt(t));
+    if (weather_haze > 0) {
+        const float w = weather_haze * (1 - std::exp(-t * fog_distance / (weather_reach > 1 ? weather_reach : 1)));
+        a = 1 - (1 - a) * (1 - w);
+    }
+    return a;
+}
+
 struct RenderOptions {
     int zlo = 0, zhi = -1;       // z-levels to draw
-    float view_distance = 24;    // tiles at which things have faded into haze
+    float view_distance = 24;    // tiles: the map is drawn this far
+    // tiles at which things have faded into haze; 0: the view distance. With the
+    // far land on it is the horizon's distance, and the map itself is barely hazed.
+    float fog_distance = 0;
+    bool far_land = false;       // draw Scene::far beyond the map
     float daylight = 1;          // 0 = night, 1 = day
     uint32_t fog = 0xFF0C0908;   // colour distant things fade into
+    // Fog, rain, snow or an evil cloud: a haze of their own over everything, as
+    // thick as weather_haze (0..1) and reaching that over some weather_reach
+    // tiles. It never shortens what is drawn: the land stays, faintly.
+    float weather_haze = 0;
+    float weather_reach = 30;
     Pick highlight;              // tile or creature under the pointer, drawn brighter
+    const Sky *sky = nullptr;    // the sky (sky.h); without it a plain blue
+    // rain and snow: the graphics card renderer draws them over the world (the software one leaves them to the caller)
+    const Precip *precip = nullptr;
+    const Weather *weather = nullptr;
+    int wave_frame = 0;          // the step of the waves' animation (Cell::water, CELL_WAVES)
 };
 
 class WorkerPool {
@@ -91,7 +123,7 @@ private:
     struct Span {
         int16_t a, b;       // rows [a, b)
         float depth;
-        int16_t tx, ty, tz; // map tile it belongs to (-1 for sky)
+        int16_t tx, ty, tz; // map tile it belongs to (-1 for sky, -2 for the far land)
     };
     static constexpr int MAX_SPANS = 64;
 
@@ -99,13 +131,21 @@ private:
     void renderColumns(const Frame &f, int x0, int x1);
     void renderBillboards(const Frame &f, int x0, int x1);
     template <class MaskedFn>
-    void draw_ring(const Frame &f, const Billboard &b, float bill_depth, int x0, int x1, MaskedFn &draw_masked_until);
+    void draw_ring(const Frame &f, const Billboard &b, float bill_depth, int x0, int x1, bool with_arrow,
+                   MaskedFn &draw_masked_until);
 
     WorkerPool pool_;
     std::vector<Span> spans_;          // W * MAX_SPANS
     std::vector<uint8_t> span_count_;  // W
     std::vector<float> row_inv_;       // H
     std::vector<uint32_t> sky_row_;    // H
+    std::vector<float> far_depth_;     // W * H, column by column: depth of the far land drawn there
+    // Water is see-through: where a ray crosses its surface the rows stay open for
+    // what lies under it, and the water's own colour (with its alpha) is kept here,
+    // for the nearest water on each pixel, to be laid over the column once it is done.
+    // Picking goes through it, to the bottom and what swims there.
+    std::vector<uint32_t> veil_;       // W * H, column by column; 0 = no water
+    std::vector<float> veil_d_;        // W * H: how far away that water is
 
     // picking: per pixel column, the billboard spans drawn on top
     struct BillHit {

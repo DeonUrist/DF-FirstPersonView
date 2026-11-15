@@ -1,4 +1,5 @@
 #include "gpu.h"
+#include "sky.h"
 
 #include <algorithm>
 #include <atomic>
@@ -15,9 +16,8 @@ namespace fpv {
 namespace {
 
 constexpr float NEAR_D = 0.08f;         // nothing nearer to the eye than this is drawn
-constexpr int MAX_SPLIT = 12;           // pieces a surface is cut into along one side, at most
-constexpr float SPLIT_RATIO = 1.12f;    // a piece may be this much deeper at one end than at the other
-constexpr float INV_LOG_SPLIT = 1.0f / 0.113329f;   // 1 / ln(SPLIT_RATIO)
+constexpr int MAX_SPLIT = 24;           // pieces a surface is cut into along one side, at most
+constexpr float SPLIT_ERROR = 1.0f;     // how far out of place (in screen pixels) a picture may be inside a piece
 constexpr int WHITE_BOX = 8;            // a plain white square in the texture, for flat colours
 constexpr int SKY_SECTORS = 32;
 
@@ -82,21 +82,11 @@ int clip_near(const VV *in, int n, VV *out, float nearz) {
     return m;
 }
 
-// how much haze lies over something, by its distance as a fraction of the view distance
-struct FogTable {
-    uint8_t a[1025];
-    FogTable() {
-        for (int i = 0; i <= 1024; ++i) {
-            const float t = i / 1024.0f;
-            a[i] = uint8_t(std::clamp(0.97f * t * std::sqrt(std::sqrt(t)) * 255.0f + 0.5f, 0.0f, 255.0f));
-        }
-    }
-};
-const FogTable FOG;
 
 struct TexEntry {
-    Region r[3];                    // opaque, cut out, cut out in white
-    std::atomic<uint8_t> ready[3];  // set once r is filled in: workers look these up side by side
+    // opaque, cut out, cut out in white, see-through as its pixels say (water), the same in white
+    Region r[5];
+    std::atomic<uint8_t> ready[5];  // set once r is filled in: workers look these up side by side
 };
 constexpr int MAX_TEX = 65536;
 
@@ -129,6 +119,14 @@ struct DecalPoly {
     uint8_t alpha;
 };
 
+// the mark on the ground under one creature: a run of DecalPoly
+struct Decal {
+    int cx, cy, z;      // the creature's tile
+    float h;            // height it lies at
+    SDL_Color col;
+    int first, count;
+};
+
 } // namespace
 
 struct GpuRenderer::Impl {
@@ -147,12 +145,27 @@ struct GpuRenderer::Impl {
     std::mutex atlas_mutex;                    // guards everything about the big texture while workers run
     WorkerPool pool{std::clamp(int(std::thread::hardware_concurrency()) - 2, 1, 8)};
     std::vector<RowOut> rows;
+    std::vector<RowOut> far_out;               // the far land's triangles, a list per run of it
+    // Snow specks for the far land's leaves: white specks on nothing, at a few
+    // densities, each a sheet of 8 x 8 tiles at 32, 16, 8 and 4 pixels a tile.
+    static constexpr int SPECK_DENS = 4, SPECK_RES = 4;
+    Region speck[SPECK_DENS][SPECK_RES];
     std::unordered_map<uint64_t, std::unique_ptr<SpriteEntry>> sprites;   // by what they show
     std::unordered_map<const Sprite *, PtrRef> by_ptr;
     uint32_t frame = 0;
 
     std::vector<SDL_Vertex> verts;
     std::vector<int> idx;
+    size_t bg_end = 0;                         // the first indices are the haze behind everything
+
+    // the sky and the falling drops as triangles (sky.h), with their pictures in a texture of their own
+    SDL_Texture *sky_tex = nullptr;
+    SDL_Renderer *sky_owner = nullptr;
+    uint32_t sky_serial = 0;                   // the atlas the texture holds
+    const SkyAtlas *sky_atlas = nullptr;       // this frame's
+    SkyMesh sky_mesh, drop_mesh;
+    std::vector<SDL_Vertex> sky_verts;         // a mesh handed to SDL
+    int us_sky = 0, us_drops = 0;
     std::vector<BRef> brefs;
     std::vector<int16_t> bill_lo, bill_hi;
     std::vector<int> order_x, order_y, order_z;
@@ -163,6 +176,7 @@ struct GpuRenderer::Impl {
     bool valid = false;
     int last_tris = 0;
     int us_prep = 0, us_cells = 0, us_draw = 0, n_cols = 0, n_cells = 0, n_bills = 0;
+    int us_far = 0, n_far = 0;
 
     void dirty(int x, int y, int w, int h) {
         if (dx1 <= dx0 || dy1 <= dy0) {
@@ -212,6 +226,51 @@ struct GpuRenderer::Impl {
             for (int xx = 0; xx < WHITE_BOX; ++xx)
                 px[size_t(y + yy) * size + x + xx] = 0xFFFFFFFFu;
         white = Region{x + WHITE_BOX / 2.0f, y + WHITE_BOX / 2.0f, 0, 0, false};
+        makeSpecks();
+    }
+
+    void makeSpecks() {
+        static const float DENS[SPECK_DENS] = {0.3f, 0.5f, 0.7f, 0.88f};
+        constexpr int BASE = 256;
+        std::vector<float> a(size_t(BASE) * BASE), half;
+        for (int d = 0; d < SPECK_DENS; ++d) {
+            // specks of two by two pixels (of 32 a tile), as the game draws snow on leaves
+            for (int y = 0; y < BASE; ++y)
+                for (int x = 0; x < BASE; ++x) {
+                    uint32_t h = uint32_t(x >> 1) * 0x9E3779B1u ^ uint32_t(y >> 1) * 0x85EBCA77u ^ 0x27d4eb2fu;
+                    h ^= h >> 15;
+                    h *= 0x2C1B3C6Du;
+                    h ^= h >> 13;
+                    a[size_t(y) * BASE + x] = float(h & 0xFFFF) / 65536.0f < DENS[d] ? 1.0f : 0.0f;
+                }
+            int n = BASE;
+            std::vector<float> cur = a;
+            for (int r = 0; r < SPECK_RES; ++r) {
+                int x, y;
+                speck[d][r] = Region();
+                if (!alloc(n + 2, n + 2, x, y))
+                    return;
+                for (int yy = -1; yy <= n; ++yy) {
+                    uint32_t *row = &px[size_t(y + 1 + yy) * size + x + 1];
+                    const int sy = std::clamp(yy, 0, n - 1);
+                    for (int xx = -1; xx <= n; ++xx) {
+                        const float al = cur[size_t(sy) * n + std::clamp(xx, 0, n - 1)];
+                        row[xx] = (uint32_t(al * 255 + 0.5f) << 24) | 0x00FFFFFFu;
+                    }
+                }
+                speck[d][r] = Region{float(x + 1), float(y + 1), float(n), float(n), true};
+                // the next size: every two by two pixels become one, their specks shared out
+                const int h2 = n / 2;
+                half.assign(size_t(h2) * h2, 0);
+                for (int yy = 0; yy < h2; ++yy)
+                    for (int xx = 0; xx < h2; ++xx)
+                        half[size_t(yy) * h2 + xx] = (cur[size_t(2 * yy) * n + 2 * xx] + cur[size_t(2 * yy) * n + 2 * xx + 1] +
+                                                      cur[size_t(2 * yy + 1) * n + 2 * xx] +
+                                                      cur[size_t(2 * yy + 1) * n + 2 * xx + 1]) * 0.25f;
+                cur.swap(half);
+                n = h2;
+            }
+        }
     }
 
     bool ensureTexture(SDL_Renderer *sdl) {
@@ -248,6 +307,50 @@ struct GpuRenderer::Impl {
         return true;
     }
 
+    // the sky's pictures in a texture of their own, sent again when they change
+    bool ensureSkyTexture(SDL_Renderer *sdl) {
+        const SkyAtlas &a = *sky_atlas;
+        if (a.size <= 0)
+            return false;
+        if (sky_tex && sky_owner == sdl && sky_serial == a.serial)
+            return true;
+        if (sky_tex)
+            api.destroy_texture(sky_tex);
+        sky_tex = api.create_texture(sdl, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, a.size, a.size);
+        sky_owner = sdl;
+        sky_serial = 0;
+        if (!sky_tex)
+            return false;
+        api.set_texture_blend_mode(sky_tex, SDL_BLENDMODE_BLEND);
+        api.set_texture_scale_mode(sky_tex, SDL_ScaleModeNearest);
+        std::vector<uint32_t> argb(a.px.size());
+        for (size_t i = 0; i < argb.size(); ++i)
+            argb[i] = to_argb(a.px[i]);
+        api.update_texture(sky_tex, nullptr, argb.data(), a.size * 4);
+        sky_serial = a.serial;
+        return true;
+    }
+
+    bool drawMesh(SDL_Renderer *sdl, const SkyMesh &m) {
+        sky_verts.resize(m.v.size());
+        for (size_t i = 0; i < m.v.size(); ++i) {
+            const SkyVertex &s = m.v[i];
+            SDL_Vertex &d = sky_verts[i];
+            d.position.x = s.x;
+            d.position.y = s.y;
+            d.color = SDL_Color{s.r, s.g, s.b, s.a};
+            d.tex_coord.x = s.u;
+            d.tex_coord.y = s.v;
+        }
+        // in parts: some back ends take only so many triangles at once
+        bool good = true;
+        for (size_t at = 0; at < m.i.size(); at += 60000)
+            if (api.render_geometry(sdl, sky_tex, sky_verts.data(), int(sky_verts.size()), m.i.data() + at,
+                                    int(std::min<size_t>(60000, m.i.size() - at))) != 0)
+                good = false;
+        return good;
+    }
+
     void upload() {
         if (!tex || dx1 <= dx0 || dy1 <= dy0)
             return;
@@ -257,7 +360,7 @@ struct GpuRenderer::Impl {
     }
 
     // a wall or floor texture: mode 0 as it is, 1 with its empty pixels
-    // see-through, 2 the same in white
+    // see-through, 2 the same in white, 3 with each pixel's own alpha, 4 the same in white
     Region texRegion(const Scene &scene, uint16_t id, int mode) {
         if (!id || id >= scene.tex.size())
             return white;
@@ -277,8 +380,12 @@ struct GpuRenderer::Impl {
                 cur[i] = to_argb(c) | 0xFF000000u;
             else if (mode == 1)
                 cur[i] = c ? (to_argb(c) | 0xFF000000u) : 0;
-            else
+            else if (mode == 2)
                 cur[i] = c ? 0xFFFFFFFFu : 0;
+            else if (mode == 3)
+                cur[i] = to_argb(c);
+            else
+                cur[i] = (c & 0xFF000000u) | 0x00FFFFFFu;
         }
         for (int level = 0; level < MIPS; ++level) {
             const int n = MIP_SIZE[level];
@@ -419,22 +526,23 @@ struct Builder {
     float fx, fy, fz, rx, ry, ux, uy, uz;  // forward, right, up
     float S, cx, cy, W, H;
     float inv_view, max_d;
+    uint8_t fog_a[1025];   // how much haze lies over something, by its distance as a fraction of the fog distance
     SDL_Color fogc;
     Pick hl;
     int zlo = 0, zhi = -1, nz = 0;
-    const Cell *cells[64] = {};
+    std::vector<const Cell *> cells;   // per level, null if not captured
     int map_w = 0, map_h = 0;
     uint16_t roof = 0;
     int nboxsets = 0;
     int wx0 = 0, wy0 = 0, ww = 0, wh = 0;   // the part of the map within the view distance
-    bool decal_on = false;
-    int decal_cx = 0, decal_cy = 0, decal_z = 0;
-    float decal_h = 0;
-    SDL_Color decal_col{};
+    std::vector<Decal> decals;
     std::vector<DecalPoly> decal;
     std::vector<SDL_Vertex> *vp = nullptr;   // where the triangles go: each worker has its own
     std::vector<int> *ip = nullptr;
     int n_cols = 0, n_cells = 0;
+    bool cam_sky = false;
+    bool sky_dir[SKY_SECTORS] = {};          // ways the sky (and the land far off) can be seen
+    bool any_sky = false;
 
     Builder(GpuRenderer::Impl &g_, const Scene &scene_, const Camera &cam, const RenderOptions &opt_, int W_, int H_)
         : g(g_), scene(scene_), opt(opt_), vp(&g_.verts), ip(&g_.idx) {
@@ -456,7 +564,11 @@ struct Builder {
         W = float(W_);
         H = float(H_);
         const float view_dist = std::max(1.0f, opt.view_distance);
-        inv_view = 1.0f / view_dist;
+        inv_view = 1.0f / std::max(1.0f, opt.fog_distance > 0 ? opt.fog_distance : view_dist);
+        for (int i = 0; i <= 1024; ++i) {
+            const float a = haze_at(i / 1024.0f, 1.0f / inv_view, opt.weather_haze, opt.weather_reach);
+            fog_a[i] = uint8_t(std::clamp(a * 255.0f + 0.5f, 0.0f, 255.0f));
+        }
         max_d = view_dist + 4;
         fogc = SDL_Color{Uint8(px_r(opt.fog)), Uint8(px_g(opt.fog)), Uint8(px_b(opt.fog)), 255};
         hl = opt.highlight;
@@ -492,7 +604,7 @@ struct Builder {
             miny = std::min(miny, sy[i]);
             maxy = std::max(maxy, sy[i]);
             const float d = std::sqrt(p[i].x * p[i].x + p[i].y * p[i].y + p[i].z * p[i].z) * inv_view;
-            const int a = FOG.a[d >= 1.0f ? 1024 : int(d * 1024.0f)];
+            const int a = fog_a[d >= 1.0f ? 1024 : int(d * 1024.0f)];
             amin = std::min(amin, a);
             // Sides and ceilings are set apart the way the software renderer
             // does it: by more haze over them, not by darkening them.
@@ -662,17 +774,47 @@ struct Builder {
         }
         if (offscreen(v, 4))
             return;
-        int nu = 1, nv = 1;
-        if (zmin * SPLIT_RATIO < zmax) {
-            const auto steps = [](float a, float b) {
-                a = std::max(a, NEAR_D);
-                b = std::max(b, NEAR_D);
-                const float r = a > b ? a / b : b / a;
-                return r <= SPLIT_RATIO ? 1 : std::min(MAX_SPLIT, int(std::log(r) * INV_LOG_SPLIT) + 1);
-            };
-            nu = std::max(steps(v[0].z, v[1].z), steps(v[3].z, v[2].z));
-            nv = std::max(steps(v[0].z, v[3].z), steps(v[1].z, v[2].z));
+        // Along an edge that runs from the depth za to zb, the middle of an
+        // evenly stretched picture is out of place by the edge's length on
+        // the screen times |wa - wb| / (wa + wb), where w = 1 / sqrt(z). Cut
+        // into n pieces at even steps of w, every piece is out by the same
+        // amount, n * n times smaller: so n follows from the pixels allowed.
+        // (Cut by depth alone, a near wall a few pieces long showed its
+        // lines bent at every triangle.)
+        float zc[4], w[4], qx[4], qy[4];
+        for (int i = 0; i < 4; ++i) {
+            zc[i] = std::max(v[i].z, NEAR_D);
+            w[i] = 1.0f / std::sqrt(zc[i]);
+            const float k = S / zc[i];
+            qx[i] = v[i].x * k;
+            qy[i] = v[i].y * k;
         }
+        const float longest = (W + H) * (W + H);   // no more of an edge than this is on the screen
+        const auto steps = [&](int a, int b) {
+            const float off = (w[a] - w[b]) / (w[a] + w[b]);
+            const float ex = qx[a] - qx[b], ey = qy[a] - qy[b];
+            const float q = std::min(ex * ex + ey * ey, longest) * off * off;   // (pixels out of place) squared
+            if (q <= SPLIT_ERROR * SPLIT_ERROR)
+                return 1;
+            return std::min(MAX_SPLIT, int(std::sqrt(std::sqrt(q) / SPLIT_ERROR)) + 1);
+        };
+        // where along the edge from a to b the cuts go (0 at a, 1 at b)
+        const auto cuts = [&](int a, int b, int n, float *at) {
+            const float dz = v[b].z - v[a].z;
+            for (int i = 0; i <= n; ++i) {
+                const float f = float(i) / n;
+                if (std::abs(w[b] - w[a]) < 1e-6f || std::abs(dz) < 1e-6f) {
+                    at[i] = f;
+                } else {
+                    const float wi = w[a] + (w[b] - w[a]) * f;
+                    at[i] = std::clamp((1.0f / (wi * wi) - v[a].z) / dz, 0.0f, 1.0f);
+                }
+            }
+            at[0] = 0;
+            at[n] = 1;
+        };
+        const int nu0 = steps(0, 1), nu1 = steps(3, 2), nv0 = steps(0, 3), nv1 = steps(1, 2);
+        const int nu = std::max(nu0, nu1), nv = std::max(nv0, nv1);
         if (nu == 1 && nv == 1) {
             if (zmin >= NEAR_D) {
                 emit(v, 4, m, passes, false);
@@ -684,12 +826,21 @@ struct Builder {
             }
             return;
         }
+        // each way the cuts follow the side that needs the most of them
+        float au[MAX_SPLIT + 1], av[MAX_SPLIT + 1];
+        if (nu0 >= nu1)
+            cuts(0, 1, nu, au);
+        else
+            cuts(3, 2, nu, au);
+        if (nv0 >= nv1)
+            cuts(0, 3, nv, av);
+        else
+            cuts(1, 2, nv, av);
         VV grid[(MAX_SPLIT + 1) * (MAX_SPLIT + 1)];
         for (int j = 0; j <= nv; ++j) {
-            const float b = float(j) / nv;
-            const VV left = mix(v[0], v[3], b), right = mix(v[1], v[2], b);
+            const VV left = mix(v[0], v[3], av[j]), right = mix(v[1], v[2], av[j]);
             for (int i = 0; i <= nu; ++i)
-                grid[j * (nu + 1) + i] = mix(left, right, float(i) / nu);
+                grid[j * (nu + 1) + i] = mix(left, right, au[i]);
         }
         for (int j = 0; j < nv; ++j)
             for (int i = 0; i < nu; ++i) {
@@ -744,6 +895,18 @@ struct Builder {
         return m;
     }
 
+    // water: as see-through as its picture's pixels (the haze over it too)
+    Mat seethrough(uint16_t tid, float shade, bool lit) {
+        Mat m;
+        m.base = g.texRegion(scene, tid, 3);
+        m.sil = g.texRegion(scene, tid, 4);
+        m.mip = m.base.ok && m.sil.ok;
+        m.shade = uint8_t(shade * 255.0f + 0.5f);
+        m.lit = lit;
+        m.opaque = false;
+        return m;
+    }
+
     Mat cutout(uint16_t tid, float shade, bool lit) {
         Mat m;
         m.base = g.texRegion(scene, tid, 1);
@@ -788,6 +951,9 @@ struct Builder {
         VV c;
         tv(b.x, b.y, b.base, c);
         if (c.z < 0.25f)
+            return;
+        // smaller than a pixel on the screen (a tree far off): nothing to draw
+        if ((sp.y1 - sp.y0) * b.scale * THING_SCALE / TEX * S / c.z < 0.8f)
             return;
         SpriteEntry *e = g.spriteEntry(b.sprite);
         if (!e)
@@ -837,6 +1003,10 @@ struct Builder {
 
     // one block of a piece of furniture: the sides that face the eye
     void box(const Box &b, int mx, int my, float z0, bool lit) {
+        if (b.round) {
+            roundBox(b, mx, my, z0, lit);
+            return;
+        }
         const float X0 = mx + b.u0, X1 = mx + b.u1, Y0 = my + b.v0, Y1 = my + b.v1, Z0 = z0 + b.z0, Z1 = z0 + b.z1;
         if (X1 <= X0 || Y1 <= Y0 || Z1 <= Z0)
             return;
@@ -854,6 +1024,8 @@ struct Builder {
             } else {
                 vface(xa, ya, xb, yb, Z0, Z1, sa, sb, 0, b.z1 - b.z0, opaque(tid, pictured ? 1.0f : shade, lit));
             }
+            if (b.edge > 0 && !pictured)
+                vEdges(xa, ya, xb, yb, Z0, Z1, b.edge);
         };
         if (px < X0)
             side(FACE_W, X0, Y0, X0, Y1, false, b.v0, b.v1, 1.0f);
@@ -865,13 +1037,139 @@ struct Builder {
             side(FACE_S, X0, Y1, X1, Y1, false, b.u0, b.u1, 0.8f);
         const bool top = pe > Z1, under = pe < Z0;
         if (top || under) {
-            const uint16_t tid = top ? b.top : b.side;
+            const uint16_t tid = top ? b.top : (b.under ? b.under : b.side);
             if (tid) {
                 const Mat m = opaque(tid, top ? 1.0f : 0.6f, lit);
                 if (scene.tex.get(tid).stretch)
                     hface(X0, Y0, X1, Y1, top ? Z1 : Z0, 0, 0, 1, 1, m);
                 else
                     hface(X0, Y0, X1, Y1, top ? Z1 : Z0, b.u0, b.v0, b.u1, b.v1, m);
+                if (b.edge > 0)
+                    hEdges(X0, Y0, X1, Y1, top ? Z1 : Z0, b.edge);
+            }
+        }
+    }
+
+    // The dark line along the edges of a model's face (Box::edge): see-through
+    // black laid over the face, fading into the haze as the face does.
+    void edgePoly(const float (*P)[3], int n) {
+        VV v[8];
+        float cxw = 0, cyw = 0, czw = 0;
+        for (int i = 0; i < n; ++i) {
+            tv(P[i][0], P[i][1], P[i][2], v[i]);
+            v[i].s = v[i].t = 0;
+            cxw += v[i].x / n;
+            cyw += v[i].y / n;
+            czw += v[i].z / n;
+        }
+        if (offscreen(v, n))
+            return;
+        const float d = std::sqrt(cxw * cxw + cyw * cyw + czw * czw) * inv_view;
+        const int haze = fog_a[d >= 1.0f ? 1024 : int(d * 1024.0f)];
+        const int alpha = int((1.0f - EDGE_DARK) * float(255 - haze));
+        if (alpha > 2)
+            plain(v, n, SDL_Color{0, 0, 0, Uint8(alpha)});
+    }
+
+    // along the edges of an upright rectangle from (xa, ya) to (xb, yb), heights
+    // zb..zt; its upright ends only where `left` / `right` (corners of round pieces)
+    void vEdges(float xa, float ya, float xb, float yb, float zb, float zt, float w, bool left = true,
+                bool right = true) {
+        const float len = std::sqrt((xb - xa) * (xb - xa) + (yb - ya) * (yb - ya));
+        if (len < 1e-5f || zt <= zb)
+            return;
+        w = std::min({w, len / 2, (zt - zb) / 2});
+        const float dx = (xb - xa) / len * w, dy = (yb - ya) / len * w;
+        const float top[4][3] = {{xa, ya, zt}, {xb, yb, zt}, {xb, yb, zt - w}, {xa, ya, zt - w}};
+        const float bot[4][3] = {{xa, ya, zb + w}, {xb, yb, zb + w}, {xb, yb, zb}, {xa, ya, zb}};
+        edgePoly(top, 4);
+        edgePoly(bot, 4);
+        if (left) {
+            const float l[4][3] = {{xa, ya, zt - w}, {xa + dx, ya + dy, zt - w}, {xa + dx, ya + dy, zb + w}, {xa, ya, zb + w}};
+            edgePoly(l, 4);
+        }
+        if (right) {
+            const float r[4][3] = {{xb - dx, yb - dy, zt - w}, {xb, yb, zt - w}, {xb, yb, zb + w}, {xb - dx, yb - dy, zb + w}};
+            edgePoly(r, 4);
+        }
+    }
+
+    // along the edges of a level rectangle at height z
+    void hEdges(float x0, float y0, float x1, float y1, float z, float w) {
+        w = std::min({w, (x1 - x0) / 2, (y1 - y0) / 2});
+        const float n[4][3] = {{x0, y0, z}, {x1, y0, z}, {x1, y0 + w, z}, {x0, y0 + w, z}};
+        const float s[4][3] = {{x0, y1 - w, z}, {x1, y1 - w, z}, {x1, y1, z}, {x0, y1, z}};
+        const float wv[4][3] = {{x0, y0 + w, z}, {x0 + w, y0 + w, z}, {x0 + w, y1 - w, z}, {x0, y1 - w, z}};
+        const float e[4][3] = {{x1 - w, y0 + w, z}, {x1, y0 + w, z}, {x1, y1 - w, z}, {x1 - w, y1 - w, z}};
+        edgePoly(n, 4);
+        edgePoly(s, 4);
+        edgePoly(wv, 4);
+        edgePoly(e, 4);
+    }
+
+    // a round piece (a step of a spiral stair, its column): the sides that face
+    // the eye, then its top or underside
+    void roundBox(const Box &b, int mx, int my, float z0, bool lit) {
+        const float Z0 = z0 + b.z0, Z1 = z0 + b.z1;
+        if (Z1 <= Z0 || !b.side)
+            return;
+        const int n = b.round;
+        for (int i = 0; i < n; ++i) {
+            const int j = i + 1 < n ? i + 1 : 0;
+            const float xa = mx + b.ru[i], ya = my + b.rv[i], xb = mx + b.ru[j], yb = my + b.rv[j];
+            if (b.rnu[i] * (px - xa) + b.rnv[i] * (py - ya) <= 0)
+                continue;
+            // the picture across it centred on it (a side is shorter than a tile)
+            const float len = std::min(1.0f, std::sqrt((xb - xa) * (xb - xa) + (yb - ya) * (yb - ya)));
+            const float shade = 0.8f + 0.2f * std::abs(b.rnu[i]);
+            vface(xa, ya, xb, yb, Z0, Z1, 0.5f - len / 2, 0.5f + len / 2, 0, b.z1 - b.z0, opaque(b.side, shade, lit));
+            if (b.edge > 0)
+                vEdges(xa, ya, xb, yb, Z0, Z1, b.edge, (b.sharp >> i) & 1, (b.sharp >> j) & 1);
+        }
+        const bool top = pe > Z1, under = pe < Z0;
+        if (!top && !under)
+            return;
+        const uint16_t tid = top ? b.top : (b.under ? b.under : b.side);
+        if (!tid)
+            return;
+        const Mat m = opaque(tid, top ? 1.0f : 0.6f, lit);
+        const float z = top ? Z1 : Z0;
+        float cu = 0, cv = 0;
+        for (int i = 0; i < n; ++i) {
+            cu += b.ru[i] / n;
+            cv += b.rv[i] / n;
+        }
+        // in pieces from its middle, each a four-sided piece with two corners
+        // together (quad cuts what is near the eye smaller)
+        for (int i = 0; i < n; ++i) {
+            const int j = i + 1 < n ? i + 1 : 0;
+            const float P[4][3] = {{mx + cu, my + cv, z}, {mx + b.ru[i], my + b.rv[i], z},
+                                   {mx + b.ru[j], my + b.rv[j], z}, {mx + cu, my + cv, z}};
+            const float ST[4][2] = {{cu, cv}, {b.ru[i], b.rv[i]}, {b.ru[j], b.rv[j]}, {cu, cv}};
+            quad(P, ST, m);
+        }
+        if (b.edge > 0) {
+            // a band inside the outline: the outline moved in by the width,
+            // each corner where its two neighbouring sides, moved in, meet
+            float iu[ROUND_MAX], iv[ROUND_MAX];
+            for (int k = 0; k < n; ++k) {
+                const int p = k > 0 ? k - 1 : n - 1;
+                const float sx = b.rnu[p] + b.rnu[k], sy = b.rnv[p] + b.rnv[k];
+                const float dot = 1 + b.rnu[p] * b.rnu[k] + b.rnv[p] * b.rnv[k];
+                if (dot < 0.2f)
+                    return;   // too sharp a corner to move in
+                iu[k] = b.ru[k] - b.edge * sx / dot;
+                iv[k] = b.rv[k] - b.edge * sy / dot;
+                // moved in past the far side: too small a piece for a band
+                for (int q = 0; q < n; ++q)
+                    if (b.rnu[q] * (iu[k] - b.ru[q]) + b.rnv[q] * (iv[k] - b.rv[q]) > 1e-5f)
+                        return;
+            }
+            for (int i = 0; i < n; ++i) {
+                const int j = i + 1 < n ? i + 1 : 0;
+                const float P[4][3] = {{mx + b.ru[i], my + b.rv[i], z}, {mx + b.ru[j], my + b.rv[j], z},
+                                       {mx + iu[j], my + iv[j], z}, {mx + iu[i], my + iv[i], z}};
+                edgePoly(P, 4);
             }
         }
     }
@@ -923,6 +1221,34 @@ struct Builder {
             }
             items[i].dist = d;
         }
+        // A side of a round piece r that has all of o outside it (its own
+        // side of the line): what is on the eye's side of that line goes last.
+        // +1: r goes first, -1: o goes first, 0: no such side.
+        const auto split = [&](const Item &r, const Item &o) {
+            float qx[ROUND_MAX], qy[ROUND_MAX];
+            int nq = 0;
+            if (o.box && o.box->round) {
+                for (int i = 0; i < o.box->round; ++i) {
+                    qx[nq] = mx + o.box->ru[i];
+                    qy[nq++] = my + o.box->rv[i];
+                }
+            } else {
+                for (int i = 0; i < 4; ++i) {
+                    qx[nq] = (i & 1) ? o.hi[0] : o.lo[0];
+                    qy[nq++] = (i & 2) ? o.hi[1] : o.lo[1];
+                }
+            }
+            const Box &rb = *r.box;
+            for (int i = 0; i < rb.round; ++i) {
+                const float d = rb.rnu[i] * (mx + rb.ru[i]) + rb.rnv[i] * (my + rb.rv[i]);
+                bool apart = true;
+                for (int q = 0; q < nq && apart; ++q)
+                    apart = rb.rnu[i] * qx[q] + rb.rnv[i] * qy[q] >= d - 1e-4f;
+                if (apart)
+                    return rb.rnu[i] * px + rb.rnv[i] * py >= d ? 1 : -1;
+            }
+            return 0;
+        };
         // +1: a goes first (b can hide it), -1: b goes first, 0: cannot tell
         const auto rel = [&](const Item &a, const Item &b) {
             for (int ax = 0; ax < 3; ++ax) {
@@ -938,6 +1264,13 @@ struct Builder {
                         return 1;
                 }
             }
+            // round pieces (the steps of a spiral stair) are apart along one of their sides
+            if (a.box && a.box->round)
+                if (const int s = split(a, b))
+                    return s;
+            if (b.box && b.box->round)
+                if (const int s = split(b, a))
+                    return -s;
             // something standing inside a piece of furniture is drawn over it
             if (a.box && b.bill)
                 return 1;
@@ -972,9 +1305,10 @@ struct Builder {
             bill(*rest->b);
     }
 
-    // the part of the mark under the pointed-at creature that lies in one tile
-    void decalIn(int mx, int my) {
-        for (const DecalPoly &d : decal) {
+    // the part of the mark under a creature that lies in one tile
+    void decalIn(const Decal &dc, int mx, int my) {
+        for (int di = dc.first; di < dc.first + dc.count; ++di) {
+            const DecalPoly &d = decal[di];
             float ax[12], ay[12], bx[12], by[12];
             int n = d.n;
             for (int i = 0; i < n; ++i) {
@@ -1010,26 +1344,34 @@ struct Builder {
                 continue;
             VV v[12];
             for (int i = 0; i < n; ++i) {
-                tv(ax[i], ay[i], decal_h, v[i]);
+                tv(ax[i], ay[i], dc.h, v[i]);
                 v[i].s = v[i].t = 0;
             }
-            SDL_Color col = decal_col;
+            SDL_Color col = dc.col;
             col.a = d.alpha;
             plain(v, n, col);
         }
     }
 
-    // A faint disc on the ground around the feet of the creature the pointer
-    // is on, in its colour, and an arrow towards the tile it steps to next.
-    void makeDecal(const Billboard &b) {
+    // A faint disc on the ground around the feet of a creature in a conflict
+    // and of the one the pointer is on, in its colour; for the pointed-at one
+    // also an arrow towards the tile it steps to next.
+    void makeDecal(const Billboard &b, bool with_arrow) {
         constexpr float R = 0.36f, RIM = 0.29f, A1 = R + 0.42f;
         constexpr int N = 20;
-        decal_on = true;
-        decal_cx = int(std::floor(b.x));
-        decal_cy = int(std::floor(b.y));
-        decal_z = b.mz;
-        decal_h = b.base + 0.012f;
-        decal_col = SDL_Color{Uint8(px_r(b.ring)), Uint8(px_g(b.ring)), Uint8(px_b(b.ring)), 255};
+        const int first = int(decal.size());
+        // the count is filled in on every way out
+        struct Close {
+            std::vector<Decal> &list;
+            std::vector<DecalPoly> &polys;
+            Decal d;
+            ~Close() {
+                d.count = int(polys.size()) - d.first;
+                list.push_back(d);
+            }
+        } close{decals, decal,
+                Decal{int(std::floor(b.x)), int(std::floor(b.y)), b.mz, b.base + 0.012f,
+                      SDL_Color{Uint8(px_r(b.ring)), Uint8(px_g(b.ring)), Uint8(px_b(b.ring)), 255}, first, 0}};
         for (int i = 0; i < N; ++i) {
             const float a0 = 6.2831853f * i / N, a1 = 6.2831853f * (i + 1) / N;
             const float c0 = std::cos(a0), s0 = std::sin(a0), c1 = std::cos(a1), s1 = std::sin(a1);
@@ -1058,7 +1400,7 @@ struct Builder {
         }
         float dx = b.move_dx, dy = b.move_dy;
         const float len = std::sqrt(dx * dx + dy * dy);
-        if (len <= 0)
+        if (!with_arrow || len <= 0)
             return;
         dx /= len;
         dy /= len;
@@ -1105,7 +1447,7 @@ struct Builder {
             }
         }
         const bool roofed = roof && (c.flags & CELL_ROOFED);
-        if (!(c.solid || c.half || c.flr || c.top || c.frame || c.box || c.ramp || roofed) && b0 == b1)
+        if (!(c.solid || c.half || c.flr || c.top || c.frame || c.box || c.ramp || c.water || roofed) && b0 == b1)
             return;
         const float z0 = mz * LEVEL_H, z1 = z0 + LEVEL_H;
         const float QH = LEVEL_H / 16;
@@ -1139,14 +1481,23 @@ struct Builder {
                 return;
             float tt, tb;
             rows(scene.tex.get(c.solid), LEVEL_H, tt, tb);
-            walls(opaque(c.solid, 1.0f, lit), opaque(c.solid, 0.82f, lit), z0, z1, tt, tb,
-                  [](const Cell *n) { return n && n->solid; });
+            const auto hidden = [](const Cell *n) { return n && n->solid; };
+            // a built wall's plain bands at its foot and head: the wall's own
+            // picture keeps its place between them
+            const float foot = (c.trim && (c.flags & CELL_FOOT)) ? TRIM_H : 0;
+            const float head = (c.trim && (c.flags & CELL_HEAD)) ? TRIM_H : 0;
+            walls(opaque(c.solid, 1.0f, lit), opaque(c.solid, 0.82f, lit), z0 + foot, z1 - head, tt + head,
+                  tb - foot, hidden);
+            if (foot > 0)
+                walls(opaque(c.trim, 1.0f, lit), opaque(c.trim, 0.82f, lit), z0, z0 + foot, 1 - foot, 1, hidden);
+            if (head > 0)
+                walls(opaque(c.trim, 1.0f, lit), opaque(c.trim, 0.82f, lit), z1 - head, z1, 0, head, hidden);
             // the top of a block that has no known floor above it
             if (pe > z1 && !(above && (above->solid || above->flr || above->half)))
-                hface(X0, Y0, X1, Y1, z1, 0, 0, 1, 1, opaque(c.solid, 1.0f, lit));
-            // the underside of an overhang (ceilings all use the grey roof texture)
+                hface(X0, Y0, X1, Y1, z1, 0, 0, 1, 1, opaque(c.top ? c.top : c.solid, 1.0f, lit));
+            // the underside of an overhang (ceilings use the grey roof texture, leaves their own)
             if (pe < z0 && below && !below->solid)
-                hface(X0, Y0, X1, Y1, z0, 0, 0, 1, 1, opaque(roof ? roof : c.solid, 0.7f, lit));
+                hface(X0, Y0, X1, Y1, z0, 0, 0, 1, 1, opaque(c.half ? c.half : roof ? roof : c.solid, 0.7f, lit));
             for (const BRef *p = b0; p != b1; ++p)
                 bill(*p->b);
             return;
@@ -1161,19 +1512,56 @@ struct Builder {
         if (c.flr && pe > z0)
             hface(X0, Y0, X1, Y1, z0, 0, 0, 1, 1, opaque(c.flr, 1.0f, lit));
 
+        // The water in the tile, a see-through block: drawn after what lies
+        // under it (the floor, the part of a slope under its surface), before
+        // what stands out of it.
+        const float wl = c.water ? z0 + water_height(c) * LEVEL_H : -1e30f;
+        bool watered = false;
+        const auto water = [&] {
+            if (!c.water || watered)
+                return;
+            watered = true;
+            const uint16_t tid = water_frame(c, opt.wave_frame);
+            if (!(c.flags & CELL_UNDER) && pe > wl)
+                hface(X0, Y0, X1, Y1, wl, 0, 0, 1, 1, seethrough(tid, 1.0f, lit));
+            // the sides that stand higher than the water (or ground) beside them
+            const float wt = water_height(c);
+            const auto side = [&](const Cell *n, float xa, float ya, float xb, float yb, float shade) {
+                if (n && n->solid)
+                    return;
+                const float wb = n ? water_height(*n) : 0.0f;
+                if (wt <= wb + 0.01f)
+                    return;
+                const float h = (wt - wb) * LEVEL_H;
+                vface(xa, ya, xb, yb, z0 + wb * LEVEL_H, wl, 0, 1, 1 - h, 1, seethrough(tid, shade, lit));
+            };
+            if (px < X0)
+                side(nW, X0, Y0, X0, Y1, 1.0f);
+            else if (px > X1)
+                side(nE, X1, Y1, X1, Y0, 1.0f);
+            if (py < Y0)
+                side(nN, X1, Y0, X0, Y0, 0.82f);
+            else if (py > Y1)
+                side(nS, X0, Y1, X1, Y1, 0.82f);
+        };
+
         if (c.ramp) {
             // a slope: its surface in small pieces, the farthest first, then
-            // the upright sides that face the eye
+            // the upright sides that face the eye. In water, finer pieces: those
+            // standing wholly out of it come after the water.
             const uint16_t top = c.top ? c.top : c.half;
             if (top) {
-                constexpr int N = 4;
+                const int N = c.water ? 8 : 4;
                 const Mat m = opaque(top, 1.0f, lit);
-                int ou[N], ov[N];
+                int ou[8], ov[8];
                 for (int i = 0; i < N; ++i)
                     ou[i] = ov[i] = i;
                 const float cu = (px - mx) * N - 0.5f, cv = (py - my) * N - 0.5f;
                 std::sort(ou, ou + N, [&](int a, int b) { return std::abs(a - cu) > std::abs(b - cu); });
                 std::sort(ov, ov + N, [&](int a, int b) { return std::abs(a - cv) > std::abs(b - cv); });
+                for (int out = 0; out < (c.water ? 2 : 1); ++out) {
+                if (out)
+                    water();
                 for (int jj = 0; jj < N; ++jj)
                     for (int ii = 0; ii < N; ++ii) {
                         const int i = ou[ii], j = ov[jj];
@@ -1182,6 +1570,8 @@ struct Builder {
                         const float h10 = z0 + ramp_height(c.ramp, u1, v0) * LEVEL_H;
                         const float h11 = z0 + ramp_height(c.ramp, u1, v1) * LEVEL_H;
                         const float h01 = z0 + ramp_height(c.ramp, u0, v1) * LEVEL_H;
+                        if (c.water && (std::min({h00, h10, h11, h01}) >= wl - 1e-3f) != (out == 1))
+                            continue;
                         // only its upper side: the eye must be above the piece's
                         // surface (which is not flat, so either of its two halves will do)
                         {
@@ -1198,6 +1588,7 @@ struct Builder {
                         const float ST[4][2] = {{u0, v0}, {u1, v0}, {u1, v1}, {u0, v1}};
                         quad(P, ST, m);
                     }
+                }
             }
             if (c.half) {
                 // each side in two halves: a slope between two walls dips in the middle
@@ -1241,14 +1632,16 @@ struct Builder {
             if (pe > hq)
                 hface(X0, Y0, X1, Y1, hq, 0, 0, 1, 1, opaque(c.top ? c.top : c.half, 1.0f, lit));
         } else if (c.top) {
-            // a raised surface (water)
+            // a raised surface
             const float hq = z0 + c.topq * QH;
             if (pe > hq)
                 hface(X0, Y0, X1, Y1, hq, 0, 0, 1, 1, opaque(c.top, 1.0f, lit));
         }
+        water();
 
-        if (decal_on && mz == decal_z && std::abs(mx - decal_cx) <= 1 && std::abs(my - decal_cy) <= 1)
-            decalIn(mx, my);
+        for (const Decal &dc : decals)
+            if (mz == dc.z && std::abs(mx - dc.cx) <= 1 && std::abs(my - dc.cy) <= 1)
+                decalIn(dc, mx, my);
 
         if (c.box && c.box < nboxsets && scene.boxsets[c.box].n > 0)
             contents(scene.boxsets[c.box], mx, my, z0, lit, b0, b1);
@@ -1282,6 +1675,7 @@ struct Builder {
             }
             fan(base, 4);
         }
+        g.bg_end = (*ip).size();
         // which ways the sky can be seen: everywhere under the open sky,
         // else only where the view runs out into the open
         bool sky[SKY_SECTORS];
@@ -1305,8 +1699,20 @@ struct Builder {
             }
             any = any || sky[s];
         }
+        std::copy(sky, sky + SKY_SECTORS, sky_dir);
+        any_sky = any;
         if (!any)
             return;
+        if (opt.sky && opt.sky->ready() && opt.sky->atlas().size > 0) {
+            // the sky as triangles: dome, stars, moon, sun, clouds, fog
+            const auto t0 = std::chrono::steady_clock::now();
+            opt.sky->mesh(View3D::of(g.cam, int(W), int(H)), W, H, cam_sky ? nullptr : sky, SKY_SECTORS,
+                          g.sky_mesh);
+            g.sky_atlas = &opt.sky->atlas();
+            g.us_sky = int(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                                  t0).count());
+            return;
+        }
         const float d = opt.daylight;
         const float zen[3] = {4 + (52 - 4) * d, 6 + (104 - 6) * d, 18 + (188 - 18) * d};
         const float hor[3] = {18 + (158 - 18) * d, 22 + (196 - 22) * d, 44 + (226 - 44) * d};
@@ -1354,6 +1760,314 @@ struct Builder {
         }
     }
 
+    // a triangle in colours given at its corners (already hazed), cut where it comes too near
+    void tinted(const VV *in, const SDL_Color *col) {
+        struct CV {
+            VV v;
+            float r, g, b;
+        };
+        CV p[3], c[6];
+        for (int i = 0; i < 3; ++i)
+            p[i] = CV{in[i], float(col[i].r), float(col[i].g), float(col[i].b)};
+        int n = 0;
+        for (int i = 0; i < 3; ++i) {
+            const CV &a = p[i], &b = p[(i + 1) % 3];
+            const bool ina = a.v.z >= NEAR_D, inb = b.v.z >= NEAR_D;
+            if (ina)
+                c[n++] = a;
+            if (ina != inb) {
+                const CV &s = ina ? a : b, &e = ina ? b : a;
+                const float k = (NEAR_D - s.v.z) / (e.v.z - s.v.z);
+                c[n++] = CV{mix(s.v, e.v, k), s.r + (e.r - s.r) * k, s.g + (e.g - s.g) * k, s.b + (e.b - s.b) * k};
+            }
+        }
+        if (n < 3)
+            return;
+        const int base = int((*vp).size());
+        for (int i = 0; i < n; ++i) {
+            const float k = S / c[i].v.z;
+            SDL_Vertex v;
+            v.position.x = cx + c[i].v.x * k;
+            v.position.y = cy - c[i].v.y * k;
+            v.color = SDL_Color{Uint8(c[i].r + 0.5f), Uint8(c[i].g + 0.5f), Uint8(c[i].b + 0.5f), 255};
+            v.tex_coord.x = g.white.x * g.inv;
+            v.tex_coord.y = g.white.y * g.inv;
+            (*vp).push_back(v);
+        }
+        fan(base, n);
+    }
+
+    // One face of a block of the far land, in its colour darkened by the way it
+    // faces; with snow (0..255) specks of it over the face, w by h tiles. Where
+    // the specks would be finer than the screen shows, their colour mixed in instead.
+    void farFace(const float P[4][3], uint32_t col, float shade, uint8_t snow = 0, float w = 1, float h = 1) {
+        static const uint32_t SNOWC = rgb(232, 236, 242);
+        VV v[4];
+        for (int q = 0; q < 4; ++q)
+            tv(P[q][0], P[q][1], P[q][2], v[q]);
+        if (offscreen(v, 4))
+            return;
+        const float sn = snow / 255.0f;
+        float ppt = 1e9f;   // screen pixels a tile spans there
+        if (sn > 0.02f) {
+            const float zc = (v[0].z + v[1].z + v[2].z + v[3].z) * 0.25f;
+            ppt = zc > 0.1f ? S / zc : 1e9f;
+        }
+        const bool specks = sn > 0.02f && ppt >= 3;
+        if (sn > 0.02f && !specks) {
+            const float k = sn * 0.85f;
+            col = rgb(int(px_r(col) + (px_r(SNOWC) - px_r(col)) * k), int(px_g(col) + (px_g(SNOWC) - px_g(col)) * k),
+                      int(px_b(col) + (px_b(SNOWC) - px_b(col)) * k));
+        }
+        const auto lit = [&](const VV &p, uint32_t c) {
+            const float d = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z) * inv_view;
+            const int haze = fog_a[d >= 1.0f ? 1024 : int(d * 1024.0f)];
+            const auto ch = [&](int x, int fog) {
+                const int l = std::min(255, int(x * shade + 0.5f));
+                return Uint8((l * (255 - haze) + fog * haze + 127) / 255);
+            };
+            return SDL_Color{ch(px_r(c), fogc.r), ch(px_g(c), fogc.g), ch(px_b(c), fogc.b), 255};
+        };
+        SDL_Color c[4];
+        for (int q = 0; q < 4; ++q)
+            c[q] = lit(v[q], col);
+        const VV t1[3] = {v[0], v[1], v[2]}, t2[3] = {v[0], v[2], v[3]};
+        const SDL_Color c1[3] = {c[0], c[1], c[2]}, c2[3] = {c[0], c[2], c[3]};
+        tinted(t1, c1);
+        tinted(t2, c2);
+        if (!specks)
+            return;
+        static const float DENS[GpuRenderer::Impl::SPECK_DENS] = {0.3f, 0.5f, 0.7f, 0.88f};
+        int di = 0;
+        for (int i = 1; i < GpuRenderer::Impl::SPECK_DENS; ++i)
+            if (std::abs(DENS[i] - sn) < std::abs(DENS[di] - sn))
+                di = i;
+        const int ri = ppt >= 24 ? 0 : ppt >= 12 ? 1 : ppt >= 6 ? 2 : 3;
+        const Region r = g.speck[di][ri];
+        if (!r.ok)
+            return;
+        // the part of the sheet the face takes, from a place that differs face to face
+        const float su = std::min(w, 8.0f) / 8, sv = std::min(h, 8.0f) / 8;
+        const float seed = P[0][0] * 0.131f + P[0][1] * 0.217f + P[0][2] * 0.173f;
+        const float ou = (1 - su) * (seed - std::floor(seed)), ov = (1 - sv) * (seed * 1.7f - std::floor(seed * 1.7f));
+        VV q[4] = {v[0], v[1], v[2], v[3]};
+        q[0].s = ou;
+        q[0].t = ov;
+        q[1].s = ou + su;
+        q[1].t = ov;
+        q[2].s = ou + su;
+        q[2].t = ov + sv;
+        q[3].s = ou;
+        q[3].t = ov + sv;
+        VV cl[8];
+        const int n = clip_near(q, 4, cl, NEAR_D);
+        if (n < 3)
+            return;
+        const int base = int((*vp).size());
+        for (int i = 0; i < n; ++i) {
+            const float k = S / cl[i].z;
+            SDL_Vertex vx;
+            vx.position.x = cx + cl[i].x * k;
+            vx.position.y = cy - cl[i].y * k;
+            vx.color = lit(cl[i], SNOWC);
+            vx.tex_coord.x = (r.x + cl[i].s * r.w) * g.inv;
+            vx.tex_coord.y = (r.y + cl[i].t * r.h) * g.inv;
+            (*vp).push_back(vx);
+        }
+        fan(base, n);
+    }
+
+    // The faces of a block that face the eye: its top (or bottom) and up to two
+    // sides, each side down to low[] (north, south, west, east). Lit as the
+    // map is: tops full, west and east sides a little darker, north and south more.
+    void farBlock(float x0, float y0, float z0, float x1, float y1, float z1, const float *low, uint32_t top,
+                  uint32_t side, uint8_t snow = 0) {
+        const float w = x1 - x0, d = y1 - y0;
+        if (pe > z1) {
+            const float P[4][3] = {{x0, y0, z1}, {x1, y0, z1}, {x1, y1, z1}, {x0, y1, z1}};
+            farFace(P, top, 1.0f, snow, w, d);
+        } else if (pe < z0) {
+            const float P[4][3] = {{x0, y0, z0}, {x1, y0, z0}, {x1, y1, z0}, {x0, y1, z0}};
+            farFace(P, side, 0.6f, snow, w, d);
+        }
+        const float ln = low ? low[0] : z0, ls = low ? low[1] : z0, lw = low ? low[2] : z0, le = low ? low[3] : z0;
+        if (py < y0 && ln < z1) {
+            const float P[4][3] = {{x0, y0, z1}, {x1, y0, z1}, {x1, y0, ln}, {x0, y0, ln}};
+            farFace(P, side, 0.8f, snow, w, z1 - ln);
+        } else if (py > y1 && ls < z1) {
+            const float P[4][3] = {{x0, y1, z1}, {x1, y1, z1}, {x1, y1, ls}, {x0, y1, ls}};
+            farFace(P, side, 0.8f, snow, w, z1 - ls);
+        }
+        if (px < x0 && lw < z1) {
+            const float P[4][3] = {{x0, y0, z1}, {x0, y1, z1}, {x0, y1, lw}, {x0, y0, lw}};
+            farFace(P, side, 0.9f, snow, d, z1 - lw);
+        } else if (px > x1 && le < z1) {
+            const float P[4][3] = {{x1, y0, z1}, {x1, y1, z1}, {x1, y1, le}, {x1, y0, le}};
+            farFace(P, side, 0.9f, snow, d, z1 - le);
+        }
+    }
+
+    // The land beyond the map (Scene::far), far to near, before the map: the
+    // map covers it wherever it has something to show. A cell lying wholly in
+    // the part of the map that is drawn is left out, and so is a tree standing
+    // there; a tree goes right after the cell under it that is nearest the eye.
+    void farLand() {
+        const FarView *fv = scene.far.get();
+        if (!opt.far_land || !fv || fv->empty() || !any_sky)
+            return;
+        const float fog_end = 1.0f / inv_view;
+        const float mw = float(scene.w), mh = float(scene.h);
+        const auto shown = [&](float x, float y) {
+            const float dx = x - px, dy = y - py;
+            return x >= 0 && y >= 0 && x <= mw && y <= mh && dx * dx + dy * dy <= max_d * max_d;
+        };
+        const auto open = [&](float x, float y) {
+            if (cam_sky)
+                return true;
+            const float az = std::atan2(x - px, -(y - py));
+            int s = int(std::floor(az / 6.2831853f * SKY_SECTORS));
+            s = ((s % SKY_SECTORS) + SKY_SECTORS) % SKY_SECTORS;
+            return sky_dir[s] || sky_dir[(s + 1) % SKY_SECTORS] || sky_dir[(s + SKY_SECTORS - 1) % SKY_SECTORS];
+        };
+        const auto cell_d2 = [&](int k, int i, int j) {
+            const FarLevel &lv = fv->levels[k];
+            const float mx = lv.x0 + (i + 0.5f) * lv.step - px, my = lv.y0 + (j + 0.5f) * lv.step - py;
+            return mx * mx + my * my;
+        };
+        struct Item {
+            float key, sub;
+            int kind;   // 0 a cell, 1 a tree
+            int a, b, c;
+        };
+        // the cells in view, row by row on the workers
+        std::vector<std::pair<int, int>> rows;
+        for (int k = 0; k < int(fv->levels.size()); ++k)
+            for (int j = 0; j < fv->levels[k].n; ++j)
+                rows.emplace_back(k, j);
+        std::vector<std::vector<Item>> part(g.pool.size());
+        std::atomic<int> next{0};
+        g.pool.run([&](int wi) {
+            std::vector<Item> &out = part[wi];
+            out.clear();
+            for (;;) {
+                const int r = next.fetch_add(1);
+                if (r >= int(rows.size()))
+                    break;
+                const int k = rows[r].first, j = rows[r].second;
+                const FarLevel &lv = fv->levels[k];
+                for (int i = 0; i < lv.n; ++i) {
+                    if (k > 0 && lv.hole(i, j))
+                        continue;
+                    const float x0 = lv.x0 + i * lv.step, y0 = lv.y0 + j * lv.step;
+                    const float x1 = x0 + lv.step, y1 = y0 + lv.step;
+                    if (shown(x0, y0) && shown(x1, y0) && shown(x0, y1) && shown(x1, y1))
+                        continue;
+                    const float nx = std::clamp(px, x0, x1) - px, ny = std::clamp(py, y0, y1) - py;
+                    if (nx * nx + ny * ny > fog_end * fog_end)
+                        continue;
+                    if (!open(x0, y0) && !open(x1, y0) && !open(x0, y1) && !open(x1, y1) &&
+                        !open((x0 + x1) * 0.5f, (y0 + y1) * 0.5f))
+                        continue;
+                    const size_t at = size_t(j) * lv.n + i;
+                    const float *low = &lv.low[at * 4];
+                    const float zlo = std::min({low[0], low[1], low[2], low[3], lv.h[at]});
+                    if (!boxVisible(x0, y0, zlo, x1, y1, lv.h[at]))
+                        continue;
+                    out.push_back(Item{cell_d2(k, i, j), 0, 0, k, i, j});
+                }
+            }
+        });
+        std::vector<Item> items;
+        for (const auto &p : part)
+            items.insert(items.end(), p.begin(), p.end());
+        g.n_far = int(items.size());
+        for (int t = 0; t < int(fv->trees.size()); ++t) {
+            const FarTree &tr = fv->trees[t];
+            if (shown(tr.x, tr.y) || tr.n_full == 0)
+                continue;
+            const float dx = tr.x - px, dy = tr.y - py, d2 = dx * dx + dy * dy;
+            if (d2 > (fog_end + tr.reach) * (fog_end + tr.reach) || !open(tr.x, tr.y))
+                continue;
+            const float base = fv->boxes[tr.full].z0;
+            if (!boxVisible(tr.x - tr.reach, tr.y - tr.reach, base, tr.x + tr.reach, tr.y + tr.reach, base + tr.height))
+                continue;
+            // the cell under it nearest the eye
+            const float cx = std::clamp(px, tr.x - tr.reach, tr.x + tr.reach);
+            const float cy = std::clamp(py, tr.y - tr.reach, tr.y + tr.reach);
+            int k, i, j;
+            if (!fv->cellAt(cx, cy, k, i, j))
+                continue;
+            items.push_back(Item{cell_d2(k, i, j), d2, 1, t, 0, 0});
+        }
+        std::sort(items.begin(), items.end(), [](const Item &a, const Item &b) {
+            if (a.key != b.key)
+                return a.key > b.key;
+            if (a.kind != b.kind)
+                return a.kind < b.kind;
+            return a.sub > b.sub;
+        });
+
+        // Triangles in runs of the sorted list, side by side on the workers,
+        // each into its own list; the lists are joined in order.
+        constexpr int RUN = 192;
+        const int runs = (int(items.size()) + RUN - 1) / RUN;
+        if (int(g.far_out.size()) < runs)
+            g.far_out.resize(runs);
+        next = 0;
+        g.pool.run([&](int) {
+            Builder w = *this;
+            std::vector<std::pair<float, uint32_t>> order;
+            for (;;) {
+                const int r = next.fetch_add(1);
+                if (r >= runs)
+                    break;
+                RowOut &o = g.far_out[r];
+                o.v.clear();
+                o.i.clear();
+                w.vp = &o.v;
+                w.ip = &o.i;
+                const int end = std::min(int(items.size()), (r + 1) * RUN);
+                for (int n = r * RUN; n < end; ++n) {
+                    const Item &it = items[n];
+                    if (it.kind == 0) {
+                        const FarLevel &lv = fv->levels[it.a];
+                        const size_t at = size_t(it.c) * lv.n + it.b;
+                        const float x0 = lv.x0 + it.b * lv.step, y0 = lv.y0 + it.c * lv.step;
+                        w.farBlock(x0, y0, -1e9f, x0 + lv.step, y0 + lv.step, lv.h[at], &lv.low[at * 4], lv.top[at],
+                                   lv.side[at]);
+                        continue;
+                    }
+                    const FarTree &tr = fv->trees[it.a];
+                    // near, every band of leaves; farther, one block a level
+                    const bool close = it.sub < 100.0f * 100.0f;
+                    const uint32_t first = close ? tr.full : tr.simple, count = close ? tr.n_full : tr.n_simple;
+                    order.clear();
+                    for (uint32_t bi = first; bi < first + count; ++bi) {
+                        const FarBox &b = fv->boxes[bi];
+                        const float mx = (b.x0 + b.x1) * 0.5f - px, my = (b.y0 + b.y1) * 0.5f - py;
+                        const float mz = (b.z0 + b.z1) * 0.5f - pe;
+                        // the trunk stands inside the leaves: first, whatever its middle's distance
+                        order.emplace_back(b.leaf ? mx * mx + my * my + mz * mz : 1e30f, bi);
+                    }
+                    std::sort(order.begin(), order.end(), [](const auto &p, const auto &q) { return p.first > q.first; });
+                    for (const auto &[d, bi] : order) {
+                        const FarBox &b = fv->boxes[bi];
+                        w.farBlock(b.x0, b.y0, b.z0, b.x1, b.y1, b.z1, nullptr, b.top, b.side, b.snow);
+                    }
+                }
+            }
+        });
+        for (int r = 0; r < runs; ++r) {
+            const RowOut &o = g.far_out[r];
+            const int base = int((*vp).size());
+            (*vp).insert((*vp).end(), o.v.begin(), o.v.end());
+            const size_t at_ = (*ip).size();
+            (*ip).resize(at_ + o.i.size());
+            for (size_t i = 0; i < o.i.size(); ++i)
+                (*ip)[at_ + i] = o.i[i] + base;
+        }
+    }
+
     void run() {
         const auto t_start = std::chrono::steady_clock::now();
         map_w = scene.w;
@@ -1362,8 +2076,9 @@ struct Builder {
             scene.col_hi.size() < size_t(map_w) * map_h || scene.col_box.size() < size_t(map_w) * map_h)
             map_w = map_h = 0;
         zlo = std::max(0, opt.zlo);
-        zhi = std::min({opt.zhi, scene.d - 1, zlo + 63});
+        zhi = std::min(opt.zhi, scene.d - 1);
         nz = std::max(0, zhi - zlo + 1);
+        cells.assign(size_t(nz), nullptr);
         for (int k = 0; k < nz; ++k)
             if (const Level *L = scene.level(zlo + k))
                 if (L->cells.size() >= size_t(map_w) * map_h)
@@ -1372,10 +2087,17 @@ struct Builder {
         nboxsets = int(scene.boxsets.size());
 
         const int ccx = int(std::floor(px)), ccy = int(std::floor(py)), ccz = int(std::floor(pe / LEVEL_H));
-        bool cam_sky = false;
+        cam_sky = false;
         if (const Cell *c = at(ccz - zlo, ccx, ccy))
             cam_sky = (c->flags & CELL_SKY) != 0;
         background(cam_sky);
+        g.n_far = 0;
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            farLand();
+            g.us_far = int(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                                  t0).count());
+        }
         if (map_w <= 0 || nz <= 0)
             return;
 
@@ -1404,7 +2126,7 @@ struct Builder {
         g.brefs.clear();
         g.bill_lo.assign(size_t(ww) * wh, int16_t(32767));
         g.bill_hi.assign(size_t(ww) * wh, int16_t(-32768));
-        const Billboard *marked = nullptr;
+        std::vector<const Billboard *> marked;
         const auto consider = [&](const Billboard &b) {
             if (!b.sprite || b.mz < zlo || b.mz > zhi)
                 return;
@@ -1421,8 +2143,8 @@ struct Builder {
             g.brefs.push_back(BRef{(b.mz - zlo) * ww * wh + col, depth, &b});
             g.bill_lo[col] = std::min(g.bill_lo[col], int16_t(b.mz));
             g.bill_hi[col] = std::max(g.bill_hi[col], int16_t(b.mz));
-            if (b.ring && hl.unit_id >= 0 && b.unit_id == hl.unit_id && pe - b.base > 0.01f)
-                marked = &b;
+            if (b.ring && pe - b.base > 0.01f && (b.fight || (hl.unit_id >= 0 && b.unit_id == hl.unit_id)))
+                marked.push_back(&b);
         };
         for (int z = zlo; z <= zhi; ++z)
             if (const Level *L = scene.level(z))
@@ -1437,8 +2159,8 @@ struct Builder {
                 return a.depth > b.depth;
             return a.b->order < b.b->order;
         });
-        if (marked)
-            makeDecal(*marked);
+        for (const Billboard *b : marked)
+            makeDecal(*b, hl.unit_id >= 0 && b->unit_id == hl.unit_id);
         const auto t_prep = std::chrono::steady_clock::now();
         g.n_bills = int(g.brefs.size());
 
@@ -1532,6 +2254,11 @@ void GpuRenderer::dropTextures() {
         g.api.destroy_texture(g.tex);
     g.tex = nullptr;
     g.owner = nullptr;
+    if (g.sky_tex && g.api.destroy_texture)
+        g.api.destroy_texture(g.sky_tex);
+    g.sky_tex = nullptr;
+    g.sky_owner = nullptr;
+    g.sky_serial = 0;
     g.valid = false;
 }
 
@@ -1549,6 +2276,11 @@ bool GpuRenderer::build(SDL_Renderer *sdl, const Scene &scene, const Camera &cam
         g.prune();
     g.verts.clear();
     g.idx.clear();
+    g.sky_mesh.clear();
+    g.drop_mesh.clear();
+    g.sky_atlas = nullptr;
+    g.us_sky = g.us_drops = 0;
+    g.bg_end = 0;
     g.cam = cam;
     g.opt = opt;
     g.W = W;
@@ -1556,6 +2288,15 @@ bool GpuRenderer::build(SDL_Renderer *sdl, const Scene &scene, const Camera &cam
     g.valid = true;
     Builder b(g, scene, cam, opt, W, H);
     b.run();
+    // rain and snow, drawn over the world
+    if (opt.precip && opt.weather && opt.sky && opt.sky->ready() && opt.sky->media() && !opt.precip->empty()) {
+        const auto t0 = std::chrono::steady_clock::now();
+        opt.precip->mesh(View3D::of(cam, W, H), float(W), float(H), scene, opt.sky->atlas(), *opt.sky->media(),
+                         *opt.weather, g.drop_mesh);
+        g.sky_atlas = &opt.sky->atlas();
+        g.us_drops =
+            int(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    }
     g.last_tris = int(g.idx.size() / 3);
     return true;
 }
@@ -1569,11 +2310,23 @@ bool GpuRenderer::draw(SDL_Renderer *sdl) {
     g.upload();
     // in parts: some back ends take only so many triangles at once
     constexpr size_t CHUNK = 60000;
-    for (size_t at = 0; at < g.idx.size(); at += CHUNK) {
-        const size_t n = std::min(CHUNK, g.idx.size() - at);
-        if (g.api.render_geometry(sdl, g.tex, g.verts.data(), int(g.verts.size()), g.idx.data() + at, int(n)) != 0)
-            ok = false;
-    }
+    const auto run = [&](size_t from, size_t to) {
+        for (size_t at = from; at < to; at += CHUNK) {
+            const size_t n = std::min(CHUNK, to - at);
+            if (g.api.render_geometry(sdl, g.tex, g.verts.data(), int(g.verts.size()), g.idx.data() + at, int(n)) !=
+                0)
+                ok = false;
+        }
+    };
+    // the haze first, then the sky over it, then the world, then rain or snow
+    const size_t bg = std::min(g.bg_end, g.idx.size());
+    run(0, bg);
+    const bool sky_ready = g.sky_atlas && g.ensureSkyTexture(sdl);
+    if (sky_ready && !g.sky_mesh.i.empty() && !g.drawMesh(sdl, g.sky_mesh))
+        ok = false;
+    run(bg, g.idx.size());
+    if (sky_ready && !g.drop_mesh.i.empty() && !g.drawMesh(sdl, g.drop_mesh))
+        ok = false;
     g.us_draw = int(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
     return ok;
 }
@@ -1631,7 +2384,10 @@ int GpuRenderer::atlasPercent() const {
 
 std::string GpuRenderer::timings() const {
     const Impl &g = *d_;
-    return "prep " + std::to_string(g.us_prep) + " us, tiles " + std::to_string(g.us_cells) + " us, hand-over " +
+    return "prep " + std::to_string(g.us_prep) + " us (sky " + std::to_string(g.us_sky) + " us, " +
+           std::to_string(g.sky_mesh.i.size() / 3) + " triangles), drops " + std::to_string(g.us_drops) + " us (" +
+           std::to_string(g.drop_mesh.i.size() / 6) + "), far land " + std::to_string(g.us_far) + " us (" +
+           std::to_string(g.n_far) + " cells), tiles " + std::to_string(g.us_cells) + " us, hand-over " +
            std::to_string(g.us_draw) + " us, " +
            std::to_string(g.n_cols) + " columns, " + std::to_string(g.n_cells) + " tiles, " +
            std::to_string(g.n_bills) + " things";
