@@ -54,6 +54,9 @@ sky/snow.png        a row of square snowflakes; each flake picks one.
 thunder.wav         the thunder a few seconds after lightning in a storm. Any WAV file SDL reads
                     (PCM, any rate, mono or stereo). Played at the game's master volume times its
                     adventure ambience volume. No built-in copy: without it the storm is silent.
+                    The default is "Thunder.wav" by IllusiaProductions,
+                    https://freesound.org/s/249950/ , licensed under Creative Commons
+                    Attribution 4.0 (https://creativecommons.org/licenses/by/4.0/).
 vitals/NAME.png     the icons left of the bars by your own paperdoll: bleedout, exhaustion, pain,
                     hunger, thirst, sleepiness (under it); starving, suffocation, drowning,
                     unconscious, stunned, webbed, paralysis, numbness, fever, nausea, dizziness,

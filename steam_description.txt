@@ -102,3 +102,7 @@ Nothing is changed in your world or your saves, and you can switch the view on a
 [*]Most features can be turned off in the settings, and the field of view, draw distance and more can be changed.
 [*]All of the mod's own art (crosshairs, buttons, icons, paperdolls, sky, furniture shapes) is in its media folder for you to replace.
 [/list]
+
+[h2]Credits[/h2]
+
+Thunder sound: [url=https://freesound.org/s/249950/]"Thunder.wav"[/url] by IllusiaProductions, licensed under [url=https://creativecommons.org/licenses/by/4.0/]Creative Commons Attribution 4.0[/url].

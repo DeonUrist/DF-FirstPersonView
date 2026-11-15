@@ -708,6 +708,11 @@ Only what your adventurer has seen is drawn, because that is all the game draws.
   walk up, so an unusual ramp can slope the wrong way.
 - Creatures and items are flat sprites that always face you.
 
+## Credits
+
+- `media/thunder.wav`: "Thunder.wav" by IllusiaProductions, <https://freesound.org/s/249950/>,
+  licensed under [Creative Commons Attribution 4.0](https://creativecommons.org/licenses/by/4.0/).
+
 ## Layout
 
 ```
